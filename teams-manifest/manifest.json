@@ -1,0 +1,54 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.17",
+  "version": "1.0.0",
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+
+  "developer": {
+    "name": "TBC-Ball IT",
+    "websiteUrl": "https://teams-ai-app.vercel.app/",
+    "privacyUrl": "https://teams-ai-app.vercel.app/",
+    "termsOfUseUrl": "https://teams-ai-app.vercel.app/"
+  },
+
+  "name": {
+    "short": "AI Docs",
+    "full": "TBC-Ball AI Document Agent"
+  },
+
+  "description": {
+    "short": "Tra cứu tài liệu SOP nội bộ",
+    "full": "AI Agent kết nối SharePoint, tra cứu tài liệu bằng ngôn ngữ tự nhiên"
+  },
+
+  "icons": {
+    "color": "icon-color.png",
+    "outline": "icon-outline.png"
+  },
+
+  "accentColor": "#0a0c0f",
+
+  "staticTabs": [
+    {
+      "entityId": "aiagent-docs",
+      "name": "AI Agent",
+      "contentUrl": "https://teams-ai-app.vercel.app/",
+      "websiteUrl": "https://teams-ai-app.vercel.app/",
+      "scopes": ["personal"]
+    }
+  ],
+
+  "configurableTabs": [
+    {
+      "configurationUrl": "https://teams-ai-app.vercel.app//config.html",
+      "canUpdateConfiguration": false,
+      "scopes": ["team", "groupchat"]
+    }
+  ],
+
+  "permissions": ["identity", "messageTeamMembers"],
+
+  "validDomains": [
+    "YOUR-APP.vercel.app"
+  ]
+}

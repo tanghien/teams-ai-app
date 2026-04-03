@@ -1,4 +1,15 @@
 {
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "Content-Security-Policy",
+          "value": "frame-ancestors teams.microsoft.com *.teams.microsoft.com *.skype.com"
+        }
+      ]
+    }
+  ],
   "routes": [
     { "src": "/api/(.*)", "dest": "/api/$1" },
     { "src": "/", "dest": "/index.html" }
