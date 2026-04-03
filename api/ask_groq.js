@@ -18,11 +18,11 @@ export default async function handler(req, res) {
     }
 
     // ─── Env ─────────────────────────────────────────────────────────────────────
-    const { AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, GROQ_API_KEY } = process.env;
+    const { AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, GROQ_API_KEY_2 } = process.env;
     if (!AZURE_TENANT_ID || !AZURE_CLIENT_ID || !AZURE_CLIENT_SECRET)
       return res.status(500).json({ error: "Thiếu biến môi trường Azure." });
-    if (!GROQ_API_KEY)
-      return res.status(500).json({ error: "Thiếu biến môi trường GROQ_API_KEY." });
+    if (!GROQ_API_KEY_2)
+      return res.status(500).json({ error: "Thiếu biến môi trường GROQ_API_KEY_2." });
 
     // ─── 1. Access Token ─────────────────────────────────────────────────────────
     const tokenRes = await fetch(
@@ -115,7 +115,7 @@ export default async function handler(req, res) {
 
     const selectRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_API_KEY}` },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_API_KEY_2}` },
       body: JSON.stringify({
         model: "llama-3.3-70b-versatile",
         max_tokens: 50,
@@ -220,7 +220,7 @@ export default async function handler(req, res) {
 
     const answerRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_API_KEY}` },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_API_KEY_2}` },
       body: JSON.stringify({
         model: "llama-3.3-70b-versatile",
         max_tokens: 1024,

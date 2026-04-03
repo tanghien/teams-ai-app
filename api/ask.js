@@ -1,3 +1,11 @@
+import mammoth from "mammoth";
+import pdfParse from "pdf-parse";
+import XLSX from "xlsx";
+import officeParser from "officeparser";
+import { promisify } from "util";
+
+const parseOffice = promisify(officeParser.parseOfficeAsync?.bind(officeParser) ?? officeParser.parseOffice?.bind(officeParser));
+
 export default async function handler(req, res) {
   if (!req || !res) return;
   if (req.method !== "POST") {
@@ -5,7 +13,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    // ─── Parse body ──────────────────────────────────────────────────────────────
+    // ─── 1. Parse Body ───────────────────────────────────────────────────────
     let body = req.body;
     if (typeof body === "string") {
       try { body = JSON.parse(body); } catch { body = {}; }
@@ -13,18 +21,285 @@ export default async function handler(req, res) {
     if (!body || typeof body !== "object") body = {};
 
     const question = (body.question ?? "").trim();
-    if (!question) {
-      return res.status(400).json({ error: "Thiếu tham số 'question'." });
-    }
+    if (!question) return res.status(400).json({ error: "Thiếu tham số 'question'." });
 
-    // ─── Env ─────────────────────────────────────────────────────────────────────
-    const { AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, GROQ_API_KEY_2 } = process.env;
+    // ─── 2. Environment Variables ────────────────────────────────────────────
+    const {
+      AZURE_TENANT_ID,
+      AZURE_CLIENT_ID,
+      AZURE_CLIENT_SECRET,
+      GROQ_API_KEY,
+      GEMINI_API_KEY,
+      OPENROUTER_API_KEY,
+      HF_TOKEN,
+      NVIDIA_API_KEY
+    } = process.env;
+
     if (!AZURE_TENANT_ID || !AZURE_CLIENT_ID || !AZURE_CLIENT_SECRET)
       return res.status(500).json({ error: "Thiếu biến môi trường Azure." });
-    if (!GROQ_API_KEY_2)
-      return res.status(500).json({ error: "Thiếu biến môi trường GROQ_API_KEY_2." });
 
-    // ─── 1. Access Token ─────────────────────────────────────────────────────────
+    const hasAnyLLM = GROQ_API_KEY || OPENROUTER_API_KEY || HF_TOKEN || NVIDIA_API_KEY || GEMINI_API_KEY;
+    if (!hasAnyLLM)
+      return res.status(500).json({ error: "Cần ít nhất một API key free: GROQ, OPENROUTER, HF, NVIDIA hoặc GEMINI." });
+
+    // ─── 3. LLM PROVIDERS (FREE TIER — FALLBACK CHAIN 1→2→3→4→5) ────────────
+
+    // 🔹 1. Groq — Free tier, nhanh nhất, ưu tiên số 1
+    async function callGroq(prompt, systemPrompt = "", maxTokens = 1024) {
+      if (!GROQ_API_KEY) throw new Error("NO_GROQ_KEY");
+      console.log("[LLM:1/5] → Calling Groq (Free)...");
+      const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_API_KEY}` },
+        body: JSON.stringify({
+          model: "llama-3.3-70b-versatile",
+          max_tokens: maxTokens,
+          temperature: 0.3,
+          messages: [
+            ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+            { role: "user", content: prompt }
+          ]
+        })
+      });
+      const remaining = r.headers.get("x-ratelimit-remaining-requests");
+      if (remaining) console.log(`[Groq] Remaining: ${remaining} requests`);
+      const data = await r.json();
+      if (data.error) {
+        const err = new Error(data.error.message || "Groq error");
+        err.status = r.status;
+        if (r.status === 429) console.warn("[Groq] RATE LIMIT (429) — switching to next");
+        throw err;
+      }
+      console.log("[Groq] ✓ Success");
+      return data.choices?.[0]?.message?.content?.trim() ?? "";
+    }
+
+    // 🔹 2. OpenRouter — Free models
+    async function callOpenRouter(prompt, systemPrompt = "", maxTokens = 1024) {
+      if (!OPENROUTER_API_KEY) throw new Error("NO_OPENROUTER_KEY");
+      console.log("[LLM:2/5] → Calling OpenRouter (Free models)...");
+      const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+          "HTTP-Referer": "https://yourdomain.com",
+          "X-Title": "AI Docs Agent"
+        },
+        body: JSON.stringify({
+          model: "meta-llama/llama-3-8b-instruct:free",
+          max_tokens: maxTokens,
+          temperature: 0.3,
+          messages: [
+            ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+            { role: "user", content: prompt }
+          ]
+        })
+      });
+      const data = await r.json();
+      if (data.error) {
+        const err = new Error(data.error.message || "OpenRouter error");
+        err.status = r.status;
+        console.warn(`[OpenRouter] Error: ${err.message}`);
+        throw err;
+      }
+      console.log("[OpenRouter] ✓ Success");
+      return data.choices?.[0]?.message?.content?.trim() ?? "";
+    }
+
+    // 🔹 3. Hugging Face — Free inference API
+    async function callHuggingFace(prompt, systemPrompt = "", maxTokens = 1024) {
+      if (!HF_TOKEN) throw new Error("NO_HF_TOKEN");
+      console.log("[LLM:3/5] → Calling Hugging Face (Free)...");
+      const r = await fetch("https://router.huggingface.co/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${HF_TOKEN}` },
+        body: JSON.stringify({
+          model: "meta-llama/Llama-3.1-8B-Instruct:fastest",
+          max_tokens: maxTokens,
+          temperature: 0.3,
+          messages: [
+            ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+            { role: "user", content: prompt }
+          ]
+        })
+      });
+      const data = await r.json();
+      if (data.error) {
+        const err = new Error(data.error.message || "Hugging Face error");
+        err.status = r.status;
+        console.warn(`[HuggingFace] Error: ${err.message}`);
+        throw err;
+      }
+      console.log("[HuggingFace] ✓ Success");
+      return data.choices?.[0]?.message?.content?.trim() ?? "";
+    }
+
+    // 🔹 4. NVIDIA NIM — Free tier
+    async function callNvidia(prompt, systemPrompt = "", maxTokens = 1024) {
+      if (!NVIDIA_API_KEY) throw new Error("NO_NVIDIA_KEY");
+      console.log("[LLM:4/5] → Calling NVIDIA NIM (Free)...");
+      const r = await fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${NVIDIA_API_KEY}` },
+        body: JSON.stringify({
+          model: "thudm/glm-4-7b",
+          max_tokens: maxTokens,
+          temperature: 0.3,
+          messages: [
+            ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+            { role: "user", content: prompt }
+          ]
+        })
+      });
+      const data = await r.json();
+      if (data.error) {
+        const err = new Error(data.error.message || "NVIDIA error");
+        err.status = r.status;
+        console.warn(`[NVIDIA] Error: ${err.message}`);
+        throw err;
+      }
+      console.log("[NVIDIA] ✓ Success");
+      return data.choices?.[0]?.message?.content?.trim() ?? "";
+    }
+
+    // 🔹 5. Gemini Free — Last resort (20 req/ngày, text only)
+    async function callGemini(prompt, systemPrompt = "", maxTokens = 1024) {
+      if (!GEMINI_API_KEY) throw new Error("NO_GEMINI_KEY");
+      console.log("[LLM:5/5] → Calling Gemini Free (LAST RESORT)...");
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...(systemPrompt && { system_instruction: { parts: [{ text: systemPrompt }] } }),
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { maxOutputTokens: maxTokens, temperature: 0.3 }
+          })
+        }
+      );
+      const data = await r.json();
+      if (data.error) {
+        if (data.error.message?.includes("quota") || r.status === 429) {
+          console.error("[Gemini] QUOTA EXCEEDED — No more free providers available!");
+          throw new Error("HẾT LIMIT TẤT CẢ PROVIDER FREE. Vui lòng thử lại sau hoặc nâng cấp API key.");
+        }
+        console.error(`[Gemini] Error: ${data.error.message}`);
+        throw new Error(`Gemini error: ${data.error.message}`);
+      }
+      console.log("[Gemini] ✓ Success");
+      return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
+    }
+
+    // 🔀 Fallback chain: Groq → OpenRouter → HuggingFace → NVIDIA → Gemini
+    async function callLLM(prompt, systemPrompt = "", maxTokens = 1024) {
+      if (GROQ_API_KEY) {
+        try { return await callGroq(prompt, systemPrompt, maxTokens); }
+        catch (e) { console.warn(`[Fallback 1→2] Groq: ${e.message}`); }
+      }
+      if (OPENROUTER_API_KEY) {
+        try { return await callOpenRouter(prompt, systemPrompt, maxTokens); }
+        catch (e) { console.warn(`[Fallback 2→3] OpenRouter: ${e.message}`); }
+      }
+      if (HF_TOKEN) {
+        try { return await callHuggingFace(prompt, systemPrompt, maxTokens); }
+        catch (e) { console.warn(`[Fallback 3→4] HuggingFace: ${e.message}`); }
+      }
+      if (NVIDIA_API_KEY) {
+        try { return await callNvidia(prompt, systemPrompt, maxTokens); }
+        catch (e) { console.warn(`[Fallback 4→5] NVIDIA: ${e.message}`); }
+      }
+      console.log("[Fallback] Using Gemini Free as LAST RESORT (limit 20 req/ngày)");
+      return await callGemini(prompt, systemPrompt, maxTokens);
+    }
+
+    // ─── 4. Local File Parsers ────────────────────────────────────────────────
+
+    const TEXT_EXTS    = new Set([".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm", ".log"]);
+    const PDF_EXTS     = new Set([".pdf"]);
+    const DOCX_EXTS    = new Set([".docx"]);
+    const XLSX_EXTS    = new Set([".xlsx", ".xls"]);
+    const PPTX_EXTS    = new Set([".pptx"]);
+    const MAX_CHARS    = 15000; // giới hạn ký tự gửi LLM
+    const MAX_FILE_MB  = 20;    // giới hạn kích thước file tải về
+
+    function truncate(text) {
+      return text.length > MAX_CHARS ? text.substring(0, MAX_CHARS) + "\n...[bị cắt bớt]" : text;
+    }
+
+    // Đọc nội dung text thuần
+    async function parseText(buffer) {
+      return buffer.toString("utf-8");
+    }
+
+    // Đọc PDF bằng pdf-parse (không cần Gemini Vision)
+    async function parsePdf(buffer) {
+      try {
+        const data = await pdfParse(buffer);
+        const text = data.text?.trim() ?? "";
+        if (!text) throw new Error("pdf-parse không trích xuất được text (có thể là PDF scan).");
+        console.log(`[PDF] Extracted ${text.length} chars, ${data.numpages} pages`);
+        return text;
+      } catch (e) {
+        console.warn(`[PDF] pdf-parse failed: ${e.message}`);
+        throw e;
+      }
+    }
+
+    // Đọc DOCX bằng mammoth
+    async function parseDocx(buffer) {
+      const result = await mammoth.extractRawText({ buffer });
+      const text = result.value?.trim() ?? "";
+      if (!text) throw new Error("mammoth không trích xuất được nội dung .docx.");
+      console.log(`[DOCX] Extracted ${text.length} chars`);
+      return text;
+    }
+
+    // Đọc XLSX/XLS bằng xlsx
+    async function parseXlsx(buffer) {
+      const wb = XLSX.read(buffer, { type: "buffer" });
+      const sheets = wb.SheetNames.map(name => {
+        const csv = XLSX.utils.sheet_to_csv(wb.Sheets[name]);
+        return `=== Sheet: ${name} ===\n${csv}`;
+      });
+      const text = sheets.join("\n\n").trim();
+      if (!text) throw new Error("xlsx không trích xuất được nội dung.");
+      console.log(`[XLSX] Extracted ${text.length} chars, ${wb.SheetNames.length} sheets`);
+      return text;
+    }
+
+    // Đọc PPTX bằng officeparser
+    async function parsePptx(buffer) {
+      try {
+        // officeparser nhận buffer hoặc path
+        const text = await new Promise((resolve, reject) => {
+          officeParser.parseOffice(buffer, (data, err) => {
+            if (err) reject(err);
+            else resolve(data);
+          });
+        });
+        const result = (text ?? "").trim();
+        if (!result) throw new Error("officeparser không trích xuất được nội dung .pptx.");
+        console.log(`[PPTX] Extracted ${result.length} chars`);
+        return result;
+      } catch (e) {
+        console.warn(`[PPTX] officeparser failed: ${e.message}`);
+        throw e;
+      }
+    }
+
+    // Router: chọn parser theo ext, trả về text đã truncate
+    async function extractText(buffer, ext) {
+      if (TEXT_EXTS.has(ext))  return truncate(await parseText(buffer));
+      if (PDF_EXTS.has(ext))   return truncate(await parsePdf(buffer));
+      if (DOCX_EXTS.has(ext))  return truncate(await parseDocx(buffer));
+      if (XLSX_EXTS.has(ext))  return truncate(await parseXlsx(buffer));
+      if (PPTX_EXTS.has(ext))  return truncate(await parsePptx(buffer));
+      throw new Error(`Định dạng "${ext}" chưa được hỗ trợ. Dùng: TXT, PDF, DOCX, XLSX, XLS, PPTX.`);
+    }
+
+    // ─── 5. SharePoint Auth & File Listing ───────────────────────────────────
     const tokenRes = await fetch(
       `https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/token`,
       {
@@ -34,8 +309,8 @@ export default async function handler(req, res) {
           client_id: AZURE_CLIENT_ID,
           client_secret: AZURE_CLIENT_SECRET,
           scope: "https://graph.microsoft.com/.default",
-          grant_type: "client_credentials",
-        }),
+          grant_type: "client_credentials"
+        })
       }
     );
     const tokenData = await tokenRes.json();
@@ -43,7 +318,6 @@ export default async function handler(req, res) {
       return res.status(502).json({ error: "Lấy token thất bại", detail: tokenData });
     const accessToken = tokenData.access_token;
 
-    // ─── 2. Site ID ──────────────────────────────────────────────────────────────
     const siteRes = await fetch(
       `https://graph.microsoft.com/v1.0/sites/tbcball.sharepoint.com:/sites/${process.env.SHAREPOINT_SITE}`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -53,7 +327,6 @@ export default async function handler(req, res) {
       return res.status(502).json({ error: "Không lấy được site ID", detail: siteData });
     const siteId = siteData.id;
 
-    // ─── 3. Tìm Document Library ─────────────────────────────────────────────────
     const drivesRes = await fetch(
       `https://graph.microsoft.com/v1.0/sites/${siteId}/drives?$select=id,name`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -61,21 +334,18 @@ export default async function handler(req, res) {
     const drivesData = await drivesRes.json();
     const drives = drivesData.value || [];
 
-    if (process.env.DEBUG_FILES === "1") {
+    if (process.env.DEBUG_FILES === "1")
       return res.status(200).json({ _debug: true, drives });
-    }
 
     const targetDrive =
-      drives.find((d) => d.name?.toLowerCase().includes("approved sop")) ||
-      drives.find((d) => d.name?.toLowerCase().includes("document")) ||
+      drives.find(d => d.name?.toLowerCase().includes("approved sop")) ||
+      drives.find(d => d.name?.toLowerCase().includes("document")) ||
       drives[0];
 
     if (!targetDrive)
       return res.status(502).json({ error: "Không tìm thấy Document Library nào.", drives });
 
     const driveId = targetDrive.id;
-
-    // ─── 4. Đệ quy lấy tất cả file (tối đa 200) ─────────────────────────────────
     const allFiles = [];
 
     async function fetchChildren(itemId, depth = 0) {
@@ -91,168 +361,112 @@ export default async function handler(req, res) {
             id: item.id,
             name: item.name,
             size: item.size || 0,
-            path: item.parentReference?.path?.replace("/drives/" + driveId + "/root:", "") || "",
+            path: item.parentReference?.path?.replace(`/drives/${driveId}/root:`, "") || ""
           });
         } else if (item.folder) {
           await fetchChildren(item.id, depth + 1);
         }
       }
     }
-
     await fetchChildren("root");
 
-    if (allFiles.length === 0) {
+    if (allFiles.length === 0)
       return res.status(200).json({
         answer: "Không tìm thấy file nào trong thư viện tài liệu.",
-        _debug: { driveId, driveName: targetDrive.name },
+        _debug: { driveId, driveName: targetDrive.name }
       });
-    }
 
-    // ─── 5. Groq chọn file liên quan nhất ────────────────────────────────────────
-    const fileList = allFiles
+    // ─── 6. AI Chọn File ─────────────────────────────────────────────────────
+    const SUPPORTED_EXTS = new Set([...TEXT_EXTS, ...PDF_EXTS, ...DOCX_EXTS, ...XLSX_EXTS, ...PPTX_EXTS]);
+
+    // Chỉ hiển thị file có định dạng hỗ trợ cho AI chọn
+    const supportedFiles = allFiles.filter(f => {
+      const ext = f.name.substring(f.name.lastIndexOf(".")).toLowerCase();
+      return SUPPORTED_EXTS.has(ext);
+    });
+
+    const fileList = supportedFiles
       .map((f, i) => `${i + 1}. [${f.path || "/"}] ${f.name} (${Math.round(f.size / 1024)} KB)`)
       .join("\n");
 
-    const selectRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_API_KEY_2}` },
-      body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
-        max_tokens: 50,
-        temperature: 0,
-        messages: [
-          {
-            role: "system",
-            content: "Chọn file liên quan nhất đến câu hỏi. Trả lời CHỈ bằng số thứ tự (ví dụ: 5). Nếu không có file liên quan, trả lời: 0.",
-          },
-          {
-            role: "user",
-            content: `Câu hỏi: "${question}"\n\nDanh sách file:\n${fileList}`,
-          },
-        ],
-      }),
-    });
-    const selectData = await selectRes.json();
-    const selectedIndex = parseInt((selectData.choices?.[0]?.message?.content ?? "0").trim(), 10);
+    const selectedIndexStr = await callLLM(
+      `Câu hỏi: "${question}"\n\nDanh sách file:\n${fileList}`,
+      "Chọn file liên quan nhất đến câu hỏi. Trả lời CHỈ bằng số thứ tự (ví dụ: 5). Nếu không có file liên quan, trả lời: 0.",
+      50
+    );
+    const selectedIndex = parseInt(selectedIndexStr.trim(), 10);
 
-    // ─── 6. Download và extract nội dung file ────────────────────────────────────
-    let fileContent = "";
+    let answer = "";
     let selectedFile = null;
+    let usedProvider = "none";
+    const systemPrompt = "Bạn là trợ lý AI tra cứu tài liệu nội bộ. Trả lời ngắn gọn và chính xác bằng tiếng Việt.";
 
-    if (selectedIndex > 0 && selectedIndex <= allFiles.length) {
-      selectedFile = allFiles[selectedIndex - 1];
+    if (selectedIndex > 0 && selectedIndex <= supportedFiles.length) {
+      selectedFile = supportedFiles[selectedIndex - 1];
       const ext = selectedFile.name.substring(selectedFile.name.lastIndexOf(".")).toLowerCase();
 
-      // Download binary từ SharePoint
-      const dlRes = await fetch(
-        `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${selectedFile.id}/content`,
-        { headers: { Authorization: `Bearer ${accessToken}` } }
-      );
-
-      if (!dlRes.ok) {
-        fileContent = `[Không tải được file: ${selectedFile.name} — HTTP ${dlRes.status}]`;
-
-      } else if ([".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm", ".log"].includes(ext)) {
-        // ── Text thuần ───────────────────────────────────────────────────────────
-        fileContent = await dlRes.text();
-
-      } else if (ext === ".pdf") {
-        // ── PDF: extract text bằng pdf-parse ────────────────────────────────────
-        try {
-          const pdfParse = (await import("pdf-parse/lib/pdf-parse.js")).default;
-          const buffer = Buffer.from(await dlRes.arrayBuffer());
-          const data = await pdfParse(buffer, { max: 15 });
-          fileContent = data.text?.trim() || `[PDF: ${selectedFile.name} — không có text, có thể là PDF scan]`;
-        } catch (e) {
-          fileContent = `[PDF lỗi: ${e.message}]`;
-        }
-
-      } else if (ext === ".docx") {
-        // ── DOCX: extract text bằng mammoth ─────────────────────────────────────
-        try {
-          const mammoth = (await import("mammoth")).default;
-          const buffer = Buffer.from(await dlRes.arrayBuffer());
-          const result = await mammoth.extractRawText({ buffer });
-          fileContent = result.value?.trim() || `[DOCX: ${selectedFile.name} — không có text]`;
-        } catch (e) {
-          fileContent = `[DOCX lỗi: ${e.message}]`;
-        }
-
-      } else if (ext === ".xlsx" || ext === ".xls") {
-        // ── XLSX: đọc bằng SheetJS ───────────────────────────────────────────────
-        try {
-          const XLSX = (await import("xlsx")).default;
-          const buffer = Buffer.from(await dlRes.arrayBuffer());
-          const workbook = XLSX.read(buffer, { type: "buffer" });
-          const lines = [];
-          for (const sheetName of workbook.SheetNames) {
-            const sheet = workbook.Sheets[sheetName];
-            const csv = XLSX.utils.sheet_to_csv(sheet);
-            lines.push(`=== Sheet: ${sheetName} ===\n${csv}`);
-          }
-          fileContent = lines.join("\n\n").trim() || `[XLSX: ${selectedFile.name} — không có dữ liệu]`;
-        } catch (e) {
-          fileContent = `[XLSX lỗi: ${e.message}]`;
-        }
-
-      } else if (ext === ".pptx") {
-        // ── PPTX: extract text bằng officeparser ────────────────────────────────
-        try {
-          const officeParser = (await import("officeparser")).default;
-          const buffer = Buffer.from(await dlRes.arrayBuffer());
-          fileContent = await officeParser.parseOfficeAsync(buffer) || `[PPTX: ${selectedFile.name} — không có text]`;
-        } catch (e) {
-          fileContent = `[PPTX lỗi: ${e.message}]`;
-        }
-
+      // Kiểm tra kích thước trước khi tải
+      const fileSizeMB = selectedFile.size / (1024 * 1024);
+      if (fileSizeMB > MAX_FILE_MB) {
+        answer = `File "${selectedFile.name}" quá lớn (${fileSizeMB.toFixed(1)} MB). Giới hạn hiện tại là ${MAX_FILE_MB} MB.`;
       } else {
-        fileContent = `[Định dạng ${ext} chưa hỗ trợ: ${selectedFile.name}]`;
-      }
+        // Tải file
+        const dlRes = await fetch(
+          `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${selectedFile.id}/content`,
+          { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
 
-      // Giới hạn độ dài context gửi cho Groq
-      if (fileContent.length > 10000)
-        fileContent = fileContent.substring(0, 10000) + "\n...[nội dung bị cắt bớt]";
+        if (!dlRes.ok) {
+          answer = `Không tải được file "${selectedFile.name}" (HTTP ${dlRes.status}).`;
+        } else {
+          const arrayBuffer = await dlRes.arrayBuffer();
+          const buffer = Buffer.from(arrayBuffer);
+
+          try {
+            console.log(`[Parser] Extracting text from "${selectedFile.name}" (${ext})...`);
+            const extractedText = await extractText(buffer, ext);
+
+            answer = await callLLM(
+              `Nội dung tài liệu:\n\n${extractedText}\n\n---\n\nCâu hỏi: ${question}`,
+              systemPrompt,
+              1024
+            );
+            usedProvider = `local-parse(${ext})->llm-free-chain`;
+          } catch (parseErr) {
+            console.error(`[Parser] Failed for ${ext}: ${parseErr.message}`);
+            answer = `Không thể đọc file "${selectedFile.name}": ${parseErr.message}`;
+          }
+        }
+      }
+    } else {
+      // Không tìm thấy file phù hợp → gợi ý
+      answer = await callLLM(
+        `Câu hỏi: "${question}"\n\nDanh sách file hiện có:\n${fileList.substring(0, 3000)}`,
+        "Không tìm thấy file phù hợp. Hãy gợi ý người dùng nên tìm trong file nào dựa trên danh sách.",
+        512
+      );
+      usedProvider = "fallback-llm-free-chain";
     }
 
-    // ─── 7. Groq trả lời ─────────────────────────────────────────────────────────
-    const contextText = fileContent ||
-      `Không tìm thấy file phù hợp.\n\nCác file hiện có (${allFiles.length} file):\n${fileList.substring(0, 3000)}`;
-
-    const answerRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_API_KEY_2}` },
-      body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
-        max_tokens: 1024,
-        temperature: 0.3,
-        messages: [
-          {
-            role: "system",
-            content: "Bạn là trợ lý AI tra cứu tài liệu nội bộ l. Trả lời bằng ngắn gọn và chính xác dựa trên nội dung tài liệu. Nếu không đủ thông tin, hãy nói rõ.",
-          },
-          {
-            role: "user",
-            content: `Nội dung tài liệu:\n\n${contextText}\n\n---\n\nCâu hỏi: ${question}`,
-          },
-        ],
-      }),
-    });
-
-    const answerData = await answerRes.json();
-    const answer = answerData.choices?.[0]?.message?.content ?? "Không nhận được câu trả lời từ Groq.";
-
-    // ─── 8. Response ─────────────────────────────────────────────────────────────
     return res.status(200).json({
-      answer,
+      answer: answer || "Không nhận được câu trả lời.",
       meta: {
         fileSelected: selectedFile ? `${selectedFile.path}/${selectedFile.name}` : null,
         totalFiles: allFiles.length,
+        supportedFiles: supportedFiles.length,
         library: targetDrive.name,
-      },
+        provider: usedProvider,
+        supportedFormats: [...SUPPORTED_EXTS].join(", "),
+        note: "Đang dùng 100% free tier. PDF/DOCX/XLSX/PPTX được đọc local — không cần Gemini Vision."
+      }
     });
 
   } catch (err) {
     console.error("[ask.js] Unhandled error:", err);
-    return res.status(500).json({ crash: true, message: err.message ?? "Unknown error" });
+    return res.status(500).json({
+      crash: true,
+      message: err.message ?? "Unknown error",
+      tip: "Nếu lỗi 'quota exceeded': đợi reset lúc 00:00 UTC hoặc thêm API key free khác vào .env"
+    });
   }
 }
