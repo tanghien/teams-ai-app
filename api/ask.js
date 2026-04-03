@@ -52,7 +52,9 @@ export default async function handler(req, res) {
         e.message?.toLowerCase().includes("rate limit") ||
         e.message?.toLowerCase().includes("rate_limit") ||
         e.message?.toLowerCase().includes("too many") ||
-        e.message?.toLowerCase().includes("exceeded")
+        e.message?.toLowerCase().includes("exceeded") ||
+        e.message?.toLowerCase().includes("request too large") ||  // token vượt TPM limit
+        e.message?.toLowerCase().includes("reduce your message")   // Groq TPM message
       );
     }
 
@@ -237,34 +239,34 @@ export default async function handler(req, res) {
     }
 
     // 🔀 Fallback chain theo thứ tự tối ưu:
-    //   1. Groq llama-3.1-8b-instant  — nhanh nhất, 14,400 req/ngày
-    //   2. Groq llama-3.3-70b         — mạnh hơn, dùng khi 8b hết RPM/RPD
-    //   3. OpenRouter/free            — auto-router + 4 model dự phòng, 200 req/ngày
-    //   4. HuggingFace                — ổn định, không rõ limit cụ thể
-    //   5. NVIDIA NIM                 — backup
-    //   6. Gemini Free                — last resort, chỉ 20 req/ngày
+    //   1. Groq llama-3.3-70b-versatile — mạnh, TPM cao hơn 8b, context lớn
+    //   2. OpenRouter/free              — auto-router, 200 req/ngày, không bị giới hạn TPM nhỏ
+    //   3. Groq llama-3.1-8b-instant    — nhanh, 14,400 req/ngày nhưng TPM chỉ 6000 (dễ vượt với file lớn)
+    //   4. HuggingFace                  — ổn định, limit không cố định
+    //   5. NVIDIA NIM                   — backup
+    //   6. Gemini Free                  — last resort, 20 req/ngày
     async function callLLM(prompt, systemPrompt = "", maxTokens = 1024) {
-      // 1️⃣ Groq llama-3.1-8b-instant: 14,400 req/ngày, 30 RPM — ưu tiên tuyệt đối
+      // 1️⃣ Groq llama-3.3-70b-versatile: TPM cao hơn 8b, xử lý tốt file lớn
       if (GROQ_API_KEY) {
-        try { return await callGroq(prompt, systemPrompt, maxTokens); }
+        try { return await callGroq(prompt, systemPrompt, maxTokens, "llama-3.3-70b-versatile"); }
         catch (e) {
-          if (isRateLimitError(e)) {
-            console.warn("[Fallback 1→2] Groq 8b hết RPM → thử Groq 70b");
-            // 2️⃣ Groq llama-3.3-70b-versatile: mạnh hơn nhưng RPD thấp hơn (~1000/ngày)
-            try {
-              return await callGroq(prompt, systemPrompt, maxTokens, "llama-3.3-70b-versatile");
-            } catch (e2) {
-              if (isRateLimitError(e2)) console.warn("[Fallback 2→3] Groq 70b hết quota → thử OpenRouter");
-              else throw e2;
-            }
-          } else throw e;
+          if (isRateLimitError(e)) console.warn("[Fallback 1→2] Groq 70b hết quota/TPM → thử OpenRouter");
+          else throw e;
         }
       }
-      // 3️⃣ OpenRouter: auto-router + 4 model dự phòng, 200 req/ngày
+      // 2️⃣ OpenRouter: auto-router, không bị giới hạn TPM nhỏ như Groq 8b
       if (OPENROUTER_API_KEY) {
         try { return await callOpenRouter(prompt, systemPrompt, maxTokens); }
         catch (e) {
-          if (isRateLimitError(e)) console.warn("[Fallback 3→4] OpenRouter hết quota → thử HuggingFace");
+          if (isRateLimitError(e)) console.warn("[Fallback 2→3] OpenRouter hết quota → thử Groq 8b");
+          else throw e;
+        }
+      }
+      // 3️⃣ Groq llama-3.1-8b-instant: 14,400 req/ngày nhưng TPM=6000 — chỉ dùng cho prompt ngắn
+      if (GROQ_API_KEY) {
+        try { return await callGroq(prompt, systemPrompt, maxTokens, "llama-3.1-8b-instant"); }
+        catch (e) {
+          if (isRateLimitError(e)) console.warn("[Fallback 3→4] Groq 8b hết quota/TPM → thử HuggingFace");
           else throw e;
         }
       }
