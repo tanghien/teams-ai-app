@@ -18,14 +18,55 @@ export default async function handler(req, res) {
     }
 
     // ─── Env ─────────────────────────────────────────────────────────────────────
-    const { AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, GEMINI_API_KEY } = process.env;
+    const {
+      AZURE_TENANT_ID,
+      AZURE_CLIENT_ID,
+      AZURE_CLIENT_SECRET,
+      GROQ_API_KEY,
+      GEMINI_API_KEY,
+    } = process.env;
+
     if (!AZURE_TENANT_ID || !AZURE_CLIENT_ID || !AZURE_CLIENT_SECRET)
       return res.status(500).json({ error: "Thiếu biến môi trường Azure." });
-    if (!GEMINI_API_KEY)
-      return res.status(500).json({ error: "Thiếu biến môi trường GEMINI_API_KEY." });
+    if (!GROQ_API_KEY && !GEMINI_API_KEY)
+      return res.status(500).json({ error: "Cần ít nhất GROQ_API_KEY hoặc GEMINI_API_KEY." });
 
-    // ─── Helper: gọi Gemini ──────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────────
+    // LLM HELPERS
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    // ── Groq: text only, rất nhanh ───────────────────────────────────────────────
+    async function callGroq(prompt, systemPrompt = "", maxTokens = 1024) {
+      if (!GROQ_API_KEY) throw new Error("NO_GROQ_KEY");
+      const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: "llama-3.3-70b-versatile",
+          max_tokens: maxTokens,
+          temperature: 0.3,
+          messages: [
+            ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+            { role: "user", content: prompt },
+          ],
+        }),
+      });
+      const data = await r.json();
+      if (data.error) {
+        // 429 = rate limit → caller sẽ fallback Gemini
+        const err = new Error(data.error.message || "Groq error");
+        err.status = r.status;
+        throw err;
+      }
+      return data.choices?.[0]?.message?.content?.trim() ?? "";
+    }
+
+    // ── Gemini: text only ────────────────────────────────────────────────────────
     async function callGemini(prompt, systemPrompt = "", maxTokens = 1024) {
+      if (!GEMINI_API_KEY) throw new Error("NO_GEMINI_KEY");
       const r = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
         {
@@ -36,10 +77,7 @@ export default async function handler(req, res) {
               system_instruction: { parts: [{ text: systemPrompt }] },
             }),
             contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: {
-              maxOutputTokens: maxTokens,
-              temperature: 0.3,
-            },
+            generationConfig: { maxOutputTokens: maxTokens, temperature: 0.3 },
           }),
         }
       );
@@ -48,7 +86,78 @@ export default async function handler(req, res) {
       return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
     }
 
-    // ─── 1. Access Token ─────────────────────────────────────────────────────────
+    // ── Groq với fallback Gemini tự động ─────────────────────────────────────────
+    async function callLLM(prompt, systemPrompt = "", maxTokens = 1024) {
+      if (GROQ_API_KEY) {
+        try {
+          return await callGroq(prompt, systemPrompt, maxTokens);
+        } catch (e) {
+          // Nếu rate limit (429) hoặc không có key → fallback Gemini
+          console.warn(`[Groq fallback] ${e.message} — switching to Gemini`);
+        }
+      }
+      return await callGemini(prompt, systemPrompt, maxTokens);
+    }
+
+    // ── Gemini Vision: đọc file binary (PDF, DOCX, XLSX, PPTX...) ───────────────
+    async function callGeminiWithFile(fileBase64, mimeType, prompt, systemPrompt = "") {
+      if (!GEMINI_API_KEY) throw new Error("NO_GEMINI_KEY");
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...(systemPrompt && {
+              system_instruction: { parts: [{ text: systemPrompt }] },
+            }),
+            contents: [
+              {
+                parts: [
+                  { inline_data: { mime_type: mimeType, data: fileBase64 } },
+                  { text: prompt },
+                ],
+              },
+            ],
+            generationConfig: { maxOutputTokens: 2048, temperature: 0.3 },
+          }),
+        }
+      );
+      const data = await r.json();
+      if (data.error) throw new Error(`Gemini Vision error: ${data.error.message}`);
+      return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
+    }
+
+    // ── Map extension → MIME type ────────────────────────────────────────────────
+    function getMimeType(ext) {
+      const map = {
+        ".pdf":  "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xls":  "application/vnd.ms-excel",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".txt":  "text/plain",
+        ".csv":  "text/csv",
+        ".md":   "text/markdown",
+        ".html": "text/html",
+        ".htm":  "text/html",
+        ".json": "application/json",
+        ".xml":  "application/xml",
+        ".png":  "image/png",
+        ".jpg":  "image/jpeg",
+        ".jpeg": "image/jpeg",
+      };
+      return map[ext] || null;
+    }
+
+    // ── File có thể đọc text trực tiếp (không cần Vision) ────────────────────────
+    const TEXT_EXTS = [".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm", ".log"];
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // SHAREPOINT
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    // ── 1. Access Token ──────────────────────────────────────────────────────────
     const tokenRes = await fetch(
       `https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/token`,
       {
@@ -67,7 +176,7 @@ export default async function handler(req, res) {
       return res.status(502).json({ error: "Lấy token thất bại", detail: tokenData });
     const accessToken = tokenData.access_token;
 
-    // ─── 2. Site ID ──────────────────────────────────────────────────────────────
+    // ── 2. Site ID ───────────────────────────────────────────────────────────────
     const siteRes = await fetch(
       `https://graph.microsoft.com/v1.0/sites/tbcball.sharepoint.com:/sites/${process.env.SHAREPOINT_SITE}`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -77,7 +186,7 @@ export default async function handler(req, res) {
       return res.status(502).json({ error: "Không lấy được site ID", detail: siteData });
     const siteId = siteData.id;
 
-    // ─── 3. Tìm Document Library ─────────────────────────────────────────────────
+    // ── 3. Tìm Document Library ──────────────────────────────────────────────────
     const drivesRes = await fetch(
       `https://graph.microsoft.com/v1.0/sites/${siteId}/drives?$select=id,name`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -99,7 +208,7 @@ export default async function handler(req, res) {
 
     const driveId = targetDrive.id;
 
-    // ─── 4. Đệ quy lấy tất cả file (tối đa 200) ─────────────────────────────────
+    // ── 4. Đệ quy lấy tất cả file (tối đa 200) ──────────────────────────────────
     const allFiles = [];
 
     async function fetchChildren(itemId, depth = 0) {
@@ -132,25 +241,31 @@ export default async function handler(req, res) {
       });
     }
 
-    // ─── 5. Gemini chọn file liên quan nhất ──────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────────
+    // CHỌN FILE + ĐỌC NỘI DUNG + TRẢ LỜI
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    // ── 5. Chọn file liên quan (Groq nhanh, fallback Gemini) ─────────────────────
     const fileList = allFiles
       .map((f, i) => `${i + 1}. [${f.path || "/"}] ${f.name} (${Math.round(f.size / 1024)} KB)`)
       .join("\n");
 
-    const selectedIndexStr = await callGemini(
+    const selectedIndexStr = await callLLM(
       `Câu hỏi: "${question}"\n\nDanh sách file:\n${fileList}`,
       "Chọn file liên quan nhất đến câu hỏi. Trả lời CHỈ bằng số thứ tự (ví dụ: 5). Nếu không có file liên quan, trả lời: 0.",
       50
     );
     const selectedIndex = parseInt(selectedIndexStr.trim(), 10);
 
-    // ─── 6. Download và extract nội dung file ────────────────────────────────────
-    let fileContent = "";
+    // ── 6. Download + đọc nội dung file ─────────────────────────────────────────
+    let answer = "";
     let selectedFile = null;
+    let usedProvider = "none";
 
     if (selectedIndex > 0 && selectedIndex <= allFiles.length) {
       selectedFile = allFiles[selectedIndex - 1];
       const ext = selectedFile.name.substring(selectedFile.name.lastIndexOf(".")).toLowerCase();
+      const mimeType = getMimeType(ext);
 
       const dlRes = await fetch(
         `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${selectedFile.id}/content`,
@@ -158,81 +273,60 @@ export default async function handler(req, res) {
       );
 
       if (!dlRes.ok) {
-        fileContent = `[Không tải được file: ${selectedFile.name} — HTTP ${dlRes.status}]`;
+        answer = `Không tải được file "${selectedFile.name}" (HTTP ${dlRes.status}).`;
 
-      } else if ([".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm", ".log"].includes(ext)) {
-        fileContent = await dlRes.text();
+      } else if (TEXT_EXTS.includes(ext)) {
+        // ── Text file: đọc thẳng → gửi Groq (hoặc Gemini fallback) ──────────────
+        let text = await dlRes.text();
+        if (text.length > 12000) text = text.substring(0, 12000) + "\n...[bị cắt bớt]";
+        answer = await callLLM(
+          `Nội dung tài liệu:\n\n${text}\n\n---\n\nCâu hỏi: ${question}`,
+          "Bạn là trợ lý AI tra cứu tài liệu nội bộ. Trả lời ngắn gọn và chính xác bằng tiếng Việt.",
+          1024
+        );
+        usedProvider = "groq→gemini";
 
-      } else if (ext === ".pdf") {
-        try {
-          const pdfParse = (await import("pdf-parse/lib/pdf-parse.js")).default;
-          const buffer = Buffer.from(await dlRes.arrayBuffer());
-          const data = await pdfParse(buffer, { max: 15 });
-          fileContent = data.text?.trim() || `[PDF: ${selectedFile.name} — không có text, có thể là PDF scan]`;
-        } catch (e) {
-          fileContent = `[PDF lỗi: ${e.message}]`;
+      } else if (mimeType && GEMINI_API_KEY) {
+        // ── PDF/DOCX/XLSX/PPTX: dùng Gemini Vision đọc trực tiếp ─────────────────
+        const contentLength = parseInt(dlRes.headers.get("content-length") || "0", 10);
+        if (contentLength > 18 * 1024 * 1024) {
+          answer = `File "${selectedFile.name}" quá lớn (${Math.round(contentLength / 1024 / 1024)} MB). Vui lòng hỏi về file nhỏ hơn 18MB.`;
+        } else {
+          const base64 = Buffer.from(await dlRes.arrayBuffer()).toString("base64");
+          answer = await callGeminiWithFile(
+            base64,
+            mimeType,
+            question,
+            "Bạn là trợ lý AI tra cứu tài liệu nội bộ công ty. Đọc nội dung tài liệu và trả lời câu hỏi bằng tiếng Việt, ngắn gọn và chính xác. Nếu không tìm thấy thông tin liên quan, hãy nói rõ."
+          );
+          usedProvider = "gemini-vision";
         }
 
-      } else if (ext === ".docx") {
-        try {
-          const mammoth = (await import("mammoth")).default;
-          const buffer = Buffer.from(await dlRes.arrayBuffer());
-          const result = await mammoth.extractRawText({ buffer });
-          fileContent = result.value?.trim() || `[DOCX: ${selectedFile.name} — không có text]`;
-        } catch (e) {
-          fileContent = `[DOCX lỗi: ${e.message}]`;
-        }
-
-      } else if (ext === ".xlsx" || ext === ".xls") {
-        try {
-          const XLSX = (await import("xlsx")).default;
-          const buffer = Buffer.from(await dlRes.arrayBuffer());
-          const workbook = XLSX.read(buffer, { type: "buffer" });
-          const lines = [];
-          for (const sheetName of workbook.SheetNames) {
-            const sheet = workbook.Sheets[sheetName];
-            lines.push(`=== Sheet: ${sheetName} ===\n${XLSX.utils.sheet_to_csv(sheet)}`);
-          }
-          fileContent = lines.join("\n\n").trim() || `[XLSX: ${selectedFile.name} — không có dữ liệu]`;
-        } catch (e) {
-          fileContent = `[XLSX lỗi: ${e.message}]`;
-        }
-
-      } else if (ext === ".pptx") {
-        try {
-          const officeParser = (await import("officeparser")).default;
-          const buffer = Buffer.from(await dlRes.arrayBuffer());
-          fileContent = await officeParser.parseOfficeAsync(buffer) || `[PPTX: ${selectedFile.name} — không có text]`;
-        } catch (e) {
-          fileContent = `[PPTX lỗi: ${e.message}]`;
-        }
+      } else if (mimeType && !GEMINI_API_KEY) {
+        answer = `File "${selectedFile.name}" là định dạng ${ext} cần Gemini để đọc, nhưng GEMINI_API_KEY chưa được cấu hình.`;
 
       } else {
-        fileContent = `[Định dạng ${ext} chưa hỗ trợ: ${selectedFile.name}]`;
+        answer = `Định dạng ${ext} chưa được hỗ trợ.`;
       }
 
-      // Giới hạn context — Gemini chịu được nhiều hơn Groq
-      if (fileContent.length > 30000)
-        fileContent = fileContent.substring(0, 30000) + "\n...[nội dung bị cắt bớt]";
+    } else {
+      // Không tìm thấy file phù hợp → gợi ý
+      answer = await callLLM(
+        `Câu hỏi: "${question}"\n\nDanh sách file hiện có:\n${fileList.substring(0, 3000)}`,
+        "Bạn là trợ lý AI tra cứu tài liệu nội bộ. Không tìm thấy file phù hợp. Hãy gợi ý người dùng nên tìm trong file nào dựa trên danh sách.",
+        512
+      );
+      usedProvider = "groq→gemini";
     }
 
-    // ─── 7. Gemini trả lời ────────────────────────────────────────────────────────
-    const contextText = fileContent ||
-      `Không tìm thấy file phù hợp.\n\nCác file hiện có (${allFiles.length} file):\n${fileList.substring(0, 5000)}`;
-
-    const answer = await callGemini(
-      `Nội dung tài liệu:\n\n${contextText}\n\n---\n\nCâu hỏi: ${question}`,
-      "Bạn là trợ lý AI tra cứu tài liệu nội bộ. Trả lời ngắn gọn và chính xác dựa trên nội dung tài liệu. Nếu không đủ thông tin, hãy nói rõ.",
-      1024
-    ) || "Không nhận được câu trả lời.";
-
-    // ─── 8. Response ─────────────────────────────────────────────────────────────
+    // ─── Response ─────────────────────────────────────────────────────────────────
     return res.status(200).json({
-      answer,
+      answer: answer || "Không nhận được câu trả lời.",
       meta: {
         fileSelected: selectedFile ? `${selectedFile.path}/${selectedFile.name}` : null,
         totalFiles: allFiles.length,
         library: targetDrive.name,
+        provider: usedProvider,
       },
     });
 
