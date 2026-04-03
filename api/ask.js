@@ -240,49 +240,49 @@ export default async function handler(req, res) {
 
     // 🔀 Fallback chain theo thứ tự tối ưu:
     //   1. Groq llama-3.3-70b-versatile — mạnh, TPM cao hơn 8b, context lớn
-    //   2. OpenRouter/free              — auto-router, 200 req/ngày, không bị giới hạn TPM nhỏ
-    //   3. Groq llama-3.1-8b-instant    — nhanh, 14,400 req/ngày nhưng TPM chỉ 6000 (dễ vượt với file lớn)
-    //   4. HuggingFace                  — ổn định, limit không cố định
-    //   5. NVIDIA NIM                   — backup
+    //   2. Groq llama-3.1-8b-instant    — nhanh, 14,400 req/ngày nhưng TPM chỉ 6000
+    //   3. HuggingFace                  — ổn định, limit không cố định
+    //   4. NVIDIA NIM                   — backup
+    //   5. OpenRouter/free              — auto-router, 200 req/ngày (để dành, hay bị lỗi endpoint)
     //   6. Gemini Free                  — last resort, 20 req/ngày
     async function callLLM(prompt, systemPrompt = "", maxTokens = 1024) {
       // 1️⃣ Groq llama-3.3-70b-versatile: TPM cao hơn 8b, xử lý tốt file lớn
       if (GROQ_API_KEY) {
         try { return await callGroq(prompt, systemPrompt, maxTokens, "llama-3.3-70b-versatile"); }
         catch (e) {
-          if (isRateLimitError(e)) console.warn("[Fallback 1→2] Groq 70b hết quota/TPM → thử OpenRouter");
+          if (isRateLimitError(e)) console.warn("[Fallback 1→2] Groq 70b hết quota/TPM → thử Groq 8b");
           else throw e;
         }
       }
-      // 2️⃣ OpenRouter: auto-router, không bị giới hạn TPM nhỏ như Groq 8b
-      if (OPENROUTER_API_KEY) {
-        try { return await callOpenRouter(prompt, systemPrompt, maxTokens); }
-        catch (e) {
-          if (isRateLimitError(e)) console.warn("[Fallback 2→3] OpenRouter hết quota → thử Groq 8b");
-          else throw e;
-        }
-      }
-      // 3️⃣ Groq llama-3.1-8b-instant: 14,400 req/ngày nhưng TPM=6000 — chỉ dùng cho prompt ngắn
+      // 2️⃣ Groq llama-3.1-8b-instant: 14,400 req/ngày — tốt cho prompt ngắn/vừa
       if (GROQ_API_KEY) {
         try { return await callGroq(prompt, systemPrompt, maxTokens, "llama-3.1-8b-instant"); }
         catch (e) {
-          if (isRateLimitError(e)) console.warn("[Fallback 3→4] Groq 8b hết quota/TPM → thử HuggingFace");
+          if (isRateLimitError(e)) console.warn("[Fallback 2→3] Groq 8b hết quota/TPM → thử HuggingFace");
           else throw e;
         }
       }
-      // 4️⃣ HuggingFace: ổn định, limit không cố định theo ngày
+      // 3️⃣ HuggingFace: ổn định, không có hard limit/ngày rõ ràng
       if (HF_TOKEN) {
         try { return await callHuggingFace(prompt, systemPrompt, maxTokens); }
         catch (e) {
-          if (isRateLimitError(e)) console.warn("[Fallback 4→5] HuggingFace hết quota → thử NVIDIA");
+          if (isRateLimitError(e)) console.warn("[Fallback 3→4] HuggingFace hết quota → thử NVIDIA");
           else throw e;
         }
       }
-      // 5️⃣ NVIDIA NIM: backup tốt, limit ~1000 req/tháng
+      // 4️⃣ NVIDIA NIM: backup tốt, limit ~1000 req/tháng
       if (NVIDIA_API_KEY) {
         try { return await callNvidia(prompt, systemPrompt, maxTokens); }
         catch (e) {
-          if (isRateLimitError(e)) console.warn("[Fallback 5→6] NVIDIA hết quota → thử Gemini");
+          if (isRateLimitError(e)) console.warn("[Fallback 4→5] NVIDIA hết quota → thử OpenRouter");
+          else throw e;
+        }
+      }
+      // 5️⃣ OpenRouter: để dành gần cuối vì hay gặp lỗi endpoint, 200 req/ngày
+      if (OPENROUTER_API_KEY) {
+        try { return await callOpenRouter(prompt, systemPrompt, maxTokens); }
+        catch (e) {
+          if (isRateLimitError(e)) console.warn("[Fallback 5→6] OpenRouter hết quota → thử Gemini");
           else throw e;
         }
       }
