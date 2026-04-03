@@ -53,8 +53,7 @@ export default async function handler(req, res) {
       return res.status(502).json({ error: "Không lấy được site ID", detail: siteData });
     const siteId = siteData.id;
 
-    // ─── 3. Tìm Document Library "Approved SOP" ──────────────────────────────────
-    // SharePoint có thể có nhiều drive (Document Library), cần tìm đúng cái
+    // ─── 3. Tìm Document Library ─────────────────────────────────────────────────
     const drivesRes = await fetch(
       `https://graph.microsoft.com/v1.0/sites/${siteId}/drives?$select=id,name`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -62,38 +61,31 @@ export default async function handler(req, res) {
     const drivesData = await drivesRes.json();
     const drives = drivesData.value || [];
 
-    // Debug mode: trả về danh sách drives
     if (process.env.DEBUG_FILES === "1") {
       return res.status(200).json({ _debug: true, drives });
     }
 
-    // Tìm drive tên "Approved SOP", nếu không có thì dùng drive đầu tiên
     const targetDrive =
       drives.find((d) => d.name?.toLowerCase().includes("approved sop")) ||
       drives.find((d) => d.name?.toLowerCase().includes("document")) ||
       drives[0];
 
-    if (!targetDrive) {
+    if (!targetDrive)
       return res.status(502).json({ error: "Không tìm thấy Document Library nào.", drives });
-    }
 
     const driveId = targetDrive.id;
 
-    // ─── 4. Đệ quy lấy TẤT CẢ file trong drive (tối đa 200 file) ───────────────
+    // ─── 4. Đệ quy lấy tất cả file (tối đa 200) ─────────────────────────────────
     const allFiles = [];
 
     async function fetchChildren(itemId, depth = 0) {
-      if (depth > 3 || allFiles.length >= 200) return; // giới hạn độ sâu và số file
-
+      if (depth > 3 || allFiles.length >= 200) return;
       const url = itemId === "root"
         ? `https://graph.microsoft.com/v1.0/drives/${driveId}/root/children?$select=id,name,size,file,folder,parentReference`
         : `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/children?$select=id,name,size,file,folder,parentReference`;
-
       const r = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
       const d = await r.json();
-      const items = d.value || [];
-
-      for (const item of items) {
+      for (const item of (d.value || [])) {
         if (item.file) {
           allFiles.push({
             id: item.id,
@@ -117,17 +109,13 @@ export default async function handler(req, res) {
     }
 
     // ─── 5. Groq chọn file liên quan nhất ────────────────────────────────────────
-    // Gửi tên file kèm đường dẫn thư mục để Groq chọn chính xác hơn
     const fileList = allFiles
       .map((f, i) => `${i + 1}. [${f.path || "/"}] ${f.name} (${Math.round(f.size / 1024)} KB)`)
       .join("\n");
 
     const selectRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${GROQ_API_KEY}`,
-      },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_API_KEY}` },
       body: JSON.stringify({
         model: "llama-3.3-70b-versatile",
         max_tokens: 50,
@@ -145,35 +133,85 @@ export default async function handler(req, res) {
       }),
     });
     const selectData = await selectRes.json();
-    const selectedIndex = parseInt(
-      (selectData.choices?.[0]?.message?.content ?? "0").trim(),
-      10
-    );
+    const selectedIndex = parseInt((selectData.choices?.[0]?.message?.content ?? "0").trim(), 10);
 
-    // ─── 6. Đọc nội dung file được chọn ─────────────────────────────────────────
+    // ─── 6. Download và extract nội dung file ────────────────────────────────────
     let fileContent = "";
     let selectedFile = null;
 
     if (selectedIndex > 0 && selectedIndex <= allFiles.length) {
       selectedFile = allFiles[selectedIndex - 1];
       const ext = selectedFile.name.substring(selectedFile.name.lastIndexOf(".")).toLowerCase();
-      const textExtensions = [".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm", ".log"];
 
-      if (textExtensions.includes(ext)) {
-        const dlRes = await fetch(
-          `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${selectedFile.id}/content`,
-          { headers: { Authorization: `Bearer ${accessToken}` } }
-        );
-        if (dlRes.ok) {
-          fileContent = await dlRes.text();
-          if (fileContent.length > 8000)
-            fileContent = fileContent.substring(0, 8000) + "\n...[nội dung bị cắt bớt]";
+      // Download binary từ SharePoint
+      const dlRes = await fetch(
+        `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${selectedFile.id}/content`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+
+      if (!dlRes.ok) {
+        fileContent = `[Không tải được file: ${selectedFile.name} — HTTP ${dlRes.status}]`;
+
+      } else if ([".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm", ".log"].includes(ext)) {
+        // ── Text thuần ───────────────────────────────────────────────────────────
+        fileContent = await dlRes.text();
+
+      } else if (ext === ".pdf") {
+        // ── PDF: extract text bằng pdf-parse ────────────────────────────────────
+        try {
+          const pdfParse = (await import("pdf-parse/lib/pdf-parse.js")).default;
+          const buffer = Buffer.from(await dlRes.arrayBuffer());
+          const data = await pdfParse(buffer, { max: 15 });
+          fileContent = data.text?.trim() || `[PDF: ${selectedFile.name} — không có text, có thể là PDF scan]`;
+        } catch (e) {
+          fileContent = `[PDF lỗi: ${e.message}]`;
         }
+
+      } else if (ext === ".docx") {
+        // ── DOCX: extract text bằng mammoth ─────────────────────────────────────
+        try {
+          const mammoth = (await import("mammoth")).default;
+          const buffer = Buffer.from(await dlRes.arrayBuffer());
+          const result = await mammoth.extractRawText({ buffer });
+          fileContent = result.value?.trim() || `[DOCX: ${selectedFile.name} — không có text]`;
+        } catch (e) {
+          fileContent = `[DOCX lỗi: ${e.message}]`;
+        }
+
+      } else if (ext === ".xlsx" || ext === ".xls") {
+        // ── XLSX: đọc bằng SheetJS ───────────────────────────────────────────────
+        try {
+          const XLSX = (await import("xlsx")).default;
+          const buffer = Buffer.from(await dlRes.arrayBuffer());
+          const workbook = XLSX.read(buffer, { type: "buffer" });
+          const lines = [];
+          for (const sheetName of workbook.SheetNames) {
+            const sheet = workbook.Sheets[sheetName];
+            const csv = XLSX.utils.sheet_to_csv(sheet);
+            lines.push(`=== Sheet: ${sheetName} ===\n${csv}`);
+          }
+          fileContent = lines.join("\n\n").trim() || `[XLSX: ${selectedFile.name} — không có dữ liệu]`;
+        } catch (e) {
+          fileContent = `[XLSX lỗi: ${e.message}]`;
+        }
+
+      } else if (ext === ".pptx") {
+        // ── PPTX: extract text bằng officeparser ────────────────────────────────
+        try {
+          const officeParser = (await import("officeparser")).default;
+          const buffer = Buffer.from(await dlRes.arrayBuffer());
+          fileContent = await officeParser.parseOfficeAsync(buffer) || `[PPTX: ${selectedFile.name} — không có text]`;
+        } catch (e) {
+          fileContent = `[PPTX lỗi: ${e.message}]`;
+        }
+
       } else {
-        // File .docx/.xlsx/.pdf → không đọc được binary qua Graph trực tiếp
-        // Dùng tên file + đường dẫn làm context
-        fileContent = `[Tài liệu: ${selectedFile.name}]\n[Thư mục: ${selectedFile.path}]\n\nFile này là định dạng ${ext}. Không thể đọc nội dung trực tiếp. Hãy trả lời dựa trên tên file và vị trí thư mục.`;
+        fileContent = `[Định dạng ${ext} chưa hỗ trợ: ${selectedFile.name}]`;
       }
+
+      // Giới hạn độ dài context gửi cho Groq
+      if (fileContent.length > 10000)
+        fileContent = fileContent.substring(0, 10000) + "\n...[nội dung bị cắt bớt]";
     }
 
     // ─── 7. Groq trả lời ─────────────────────────────────────────────────────────
@@ -182,10 +220,7 @@ export default async function handler(req, res) {
 
     const answerRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${GROQ_API_KEY}`,
-      },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_API_KEY}` },
       body: JSON.stringify({
         model: "llama-3.3-70b-versatile",
         max_tokens: 1024,
@@ -193,7 +228,7 @@ export default async function handler(req, res) {
         messages: [
           {
             role: "system",
-            content: "Bạn là trợ lý AI tra cứu tài liệu SOP nội bộ công ty TBC-Ball. Trả lời bằng tiếng Việt, ngắn gọn và chính xác dựa trên nội dung tài liệu. Nếu không đủ thông tin, hãy nói rõ.",
+            content: "Bạn là trợ lý AI tra cứu tài liệu nội bộ l. Trả lời bằng ngắn gọn và chính xác dựa trên nội dung tài liệu. Nếu không đủ thông tin, hãy nói rõ.",
           },
           {
             role: "user",
