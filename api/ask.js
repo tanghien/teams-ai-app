@@ -48,13 +48,18 @@ export default async function handler(req, res) {
     function isRateLimitError(e) {
       return (
         e.status === 429 ||
+        e.status === 402 ||  // Payment Required — hết credit/balance
         e.message?.toLowerCase().includes("quota") ||
         e.message?.toLowerCase().includes("rate limit") ||
         e.message?.toLowerCase().includes("rate_limit") ||
         e.message?.toLowerCase().includes("too many") ||
         e.message?.toLowerCase().includes("exceeded") ||
         e.message?.toLowerCase().includes("request too large") ||
-        e.message?.toLowerCase().includes("reduce your message")
+        e.message?.toLowerCase().includes("reduce your message") ||
+        e.message?.toLowerCase().includes("insufficient balance") ||  // DeepSeek hết credit
+        e.message?.toLowerCase().includes("insufficient_quota") ||    // OpenAI-style quota
+        e.message?.toLowerCase().includes("billing") ||               // lỗi billing chung
+        e.message?.toLowerCase().includes("balance")                  // bắt rộng hơn
       );
     }
 
@@ -284,9 +289,9 @@ export default async function handler(req, res) {
 
     // 🔀 Fallback chain:
     //   1. Groq llama-3.3-70b-versatile — mạnh, TPM cao, context lớn
-    //   2. DeepSeek deepseek-chat       — 5M token free, 128K context
-    //   3. Groq llama-3.1-8b-instant    — nhanh, 14,400 req/ngày
-    //   4. NVIDIA NIM ← ĐƯA LÊN ĐÂY    — ~1000 req/tháng, test xem ổn không
+    //   2. NVIDIA NIM                   — ~1000 req/tháng, ổn định
+    //   3. DeepSeek deepseek-chat       — 5M token free, 128K context
+    //   4. Groq llama-3.1-8b-instant    — nhanh, 14,400 req/ngày
     //   5. HuggingFace                  — ổn định, limit không cố định
     //   6. OpenRouter/free              — 200 req/ngày, hay bị lỗi endpoint
     //   7. Gemini Free                  — last resort, 20 req/ngày
@@ -295,31 +300,31 @@ export default async function handler(req, res) {
       if (GROQ_API_KEY) {
         try { return await callGroq(prompt, systemPrompt, maxTokens, "llama-3.3-70b-versatile"); }
         catch (e) {
-          if (isRateLimitError(e)) console.warn("[Fallback 1→2] Groq 70b hết quota/TPM → thử DeepSeek");
+          if (isRateLimitError(e)) console.warn("[Fallback 1→2] Groq 70b hết quota/TPM → thử NVIDIA");
           else throw e;
         }
       }
-      // 2️⃣ DeepSeek
-      if (DEEPSEEK_API_KEY) {
-        try { return await callDeepSeek(prompt, systemPrompt, maxTokens); }
-        catch (e) {
-          if (isRateLimitError(e)) console.warn("[Fallback 2→3] DeepSeek hết token free → thử Groq 8b");
-          else throw e;
-        }
-      }
-      // 3️⃣ Groq 8b
-      if (GROQ_API_KEY) {
-        try { return await callGroq(prompt, systemPrompt, maxTokens, "llama-3.1-8b-instant"); }
-        catch (e) {
-          if (isRateLimitError(e)) console.warn("[Fallback 3→4] Groq 8b hết quota/TPM → thử NVIDIA");
-          else throw e;
-        }
-      }
-      // 4️⃣ NVIDIA NIM ← ĐƯA LÊN TRƯỚC để test
+      // 2️⃣ NVIDIA NIM
       if (NVIDIA_API_KEY) {
         try { return await callNvidia(prompt, systemPrompt, maxTokens); }
         catch (e) {
-          if (isRateLimitError(e)) console.warn("[Fallback 4→5] NVIDIA hết quota → thử HuggingFace");
+          if (isRateLimitError(e)) console.warn("[Fallback 2→3] NVIDIA hết quota → thử DeepSeek");
+          else throw e;
+        }
+      }
+      // 3️⃣ DeepSeek
+      if (DEEPSEEK_API_KEY) {
+        try { return await callDeepSeek(prompt, systemPrompt, maxTokens); }
+        catch (e) {
+          if (isRateLimitError(e)) console.warn("[Fallback 3→4] DeepSeek hết token free → thử Groq 8b");
+          else throw e;
+        }
+      }
+      // 4️⃣ Groq 8b
+      if (GROQ_API_KEY) {
+        try { return await callGroq(prompt, systemPrompt, maxTokens, "llama-3.1-8b-instant"); }
+        catch (e) {
+          if (isRateLimitError(e)) console.warn("[Fallback 4→5] Groq 8b hết quota/TPM → thử HuggingFace");
           else throw e;
         }
       }
