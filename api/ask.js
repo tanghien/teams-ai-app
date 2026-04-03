@@ -63,6 +63,19 @@ export default async function handler(req, res) {
       );
     }
 
+    // Helper: safe JSON parse — tránh crash khi provider trả HTML/text lỗi
+    async function safeJson(r, providerName) {
+      const rawText = await r.text();
+      try {
+        return JSON.parse(rawText);
+      } catch {
+        console.warn(`[${providerName}] Non-JSON response (HTTP ${r.status}): ${rawText.substring(0, 200)}`);
+        const err = new Error(`${providerName} trả response không hợp lệ (HTTP ${r.status})`);
+        err.status = r.status;
+        throw err;
+      }
+    }
+
     // 🔹 1. Groq
     async function callGroq(prompt, systemPrompt = "", maxTokens = 1024, model = "llama-3.1-8b-instant") {
       if (!GROQ_API_KEY) throw new Error("NO_GROQ_KEY");
@@ -82,7 +95,7 @@ export default async function handler(req, res) {
       });
       const remaining = r.headers.get("x-ratelimit-remaining-requests");
       if (remaining) console.log(`[Groq] Remaining: ${remaining} requests`);
-      const data = await r.json();
+      const data = await safeJson(r, "Groq");
       if (data.error) {
         const err = new Error(data.error.message || "Groq error");
         err.status = r.status;
@@ -93,35 +106,7 @@ export default async function handler(req, res) {
       return data.choices?.[0]?.message?.content?.trim() ?? "";
     }
 
-    // 🔹 2. DeepSeek
-    async function callDeepSeek(prompt, systemPrompt = "", maxTokens = 1024) {
-      if (!DEEPSEEK_API_KEY) throw new Error("NO_DEEPSEEK_KEY");
-      console.log("[LLM] → DeepSeek (Free 5M tokens)...");
-      const r = await fetch("https://api.deepseek.com/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
-        body: JSON.stringify({
-          model: "deepseek-chat",
-          max_tokens: maxTokens,
-          temperature: 0.3,
-          messages: [
-            ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
-            { role: "user", content: prompt }
-          ]
-        })
-      });
-      const data = await r.json();
-      if (data.error) {
-        const err = new Error(data.error.message || "DeepSeek error");
-        err.status = r.status;
-        console.warn(`[DeepSeek] Error: ${err.message}`);
-        throw err;
-      }
-      console.log("[DeepSeek] ✓ Success");
-      return data.choices?.[0]?.message?.content?.trim() ?? "";
-    }
-
-    // 🔹 3. NVIDIA NIM — đưa lên vị trí 4 để test
+    // 🔹 2. NVIDIA NIM
     async function callNvidia(prompt, systemPrompt = "", maxTokens = 1024) {
       if (!NVIDIA_API_KEY) throw new Error("NO_NVIDIA_KEY");
       console.log("[LLM] → NVIDIA NIM (Free)...");
@@ -138,7 +123,7 @@ export default async function handler(req, res) {
           ]
         })
       });
-      const data = await r.json();
+      const data = await safeJson(r, "NVIDIA");
       if (data.error) {
         const err = new Error(data.error.message || "NVIDIA error");
         err.status = r.status;
@@ -146,6 +131,34 @@ export default async function handler(req, res) {
         throw err;
       }
       console.log("[NVIDIA] ✓ Success");
+      return data.choices?.[0]?.message?.content?.trim() ?? "";
+    }
+
+    // 🔹 3. DeepSeek
+    async function callDeepSeek(prompt, systemPrompt = "", maxTokens = 1024) {
+      if (!DEEPSEEK_API_KEY) throw new Error("NO_DEEPSEEK_KEY");
+      console.log("[LLM] → DeepSeek (Free 5M tokens)...");
+      const r = await fetch("https://api.deepseek.com/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+        body: JSON.stringify({
+          model: "deepseek-chat",
+          max_tokens: maxTokens,
+          temperature: 0.3,
+          messages: [
+            ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+            { role: "user", content: prompt }
+          ]
+        })
+      });
+      const data = await safeJson(r, "DeepSeek");
+      if (data.error) {
+        const err = new Error(data.error.message || "DeepSeek error");
+        err.status = r.status;
+        console.warn(`[DeepSeek] Error: ${err.message}`);
+        throw err;
+      }
+      console.log("[DeepSeek] ✓ Success");
       return data.choices?.[0]?.message?.content?.trim() ?? "";
     }
 
@@ -181,7 +194,7 @@ export default async function handler(req, res) {
               ]
             })
           });
-          const data = await r.json();
+          const data = await safeJson(r, "HuggingFace");
           if (data.error) {
             const msg = data.error.message || "HuggingFace error";
             if (isRateLimitError({ message: msg, status: r.status })) throw Object.assign(new Error(msg), { status: r.status });
@@ -235,7 +248,7 @@ export default async function handler(req, res) {
               ]
             })
           });
-          const data = await r.json();
+          const data = await safeJson(r, "OpenRouter");
           if (data.error) {
             const msg = data.error.message || "OpenRouter error";
             if (msg.toLowerCase().includes("no endpoints") || msg.toLowerCase().includes("not found")) {
@@ -274,7 +287,7 @@ export default async function handler(req, res) {
           })
         }
       );
-      const data = await r.json();
+      const data = await safeJson(r, "Gemini");
       if (data.error) {
         if (data.error.message?.includes("quota") || r.status === 429) {
           console.error("[Gemini] QUOTA EXCEEDED — No more free providers available!");
