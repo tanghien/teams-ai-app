@@ -12,18 +12,18 @@
   },
 
   "name": {
-    "short": "AI Docs",
-    "full": "TBC-Ball AI Document Agent"
+    "short": "AI Docs  - by TangHien",
+    "full": "TBC-Ball AI Document Agent - by TangHien"
   },
 
   "description": {
-    "short": "Tra cứu tài liệu SOP nội bộ",
+    "short": "Tra cứu tài liệu SOP nội bộ - by TangHien",
     "full": "AI Agent kết nối SharePoint, tra cứu tài liệu bằng ngôn ngữ tự nhiên"
   },
 
   "icons": {
-    "color": "icon-color.png",
-    "outline": "icon-outline.png"
+    "color": "color.png",
+    "outline": "outline.png"
   },
 
   "accentColor": "#0a0c0f",
@@ -40,7 +40,7 @@
 
   "configurableTabs": [
     {
-      "configurationUrl": "https://teams-ai-app.vercel.app//config.html",
+      "configurationUrl": "https://teams-ai-app.vercel.app/config.html",
       "canUpdateConfiguration": false,
       "scopes": ["team", "groupchat"]
     }
@@ -49,6 +49,6 @@
   "permissions": ["identity", "messageTeamMembers"],
 
   "validDomains": [
-    "YOUR-APP.vercel.app"
+    "teams-ai-app.vercel.app"
   ]
 }
