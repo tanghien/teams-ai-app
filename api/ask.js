@@ -192,23 +192,49 @@ export default async function handler(req, res) {
       return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
     }
 
+    // 🔍 Chỉ fallback khi đúng lỗi rate limit / quota — lỗi thật thì throw luôn
+    function isRateLimitError(e) {
+      return (
+        e.status === 429 ||
+        e.message?.toLowerCase().includes("quota") ||
+        e.message?.toLowerCase().includes("rate limit") ||
+        e.message?.toLowerCase().includes("rate_limit") ||
+        e.message?.toLowerCase().includes("too many") ||
+        e.message?.toLowerCase().includes("exceeded")
+      );
+    }
+
     // 🔀 Fallback chain: Groq → OpenRouter → HuggingFace → NVIDIA → Gemini
+    // Chỉ chuyển provider khi gặp lỗi rate limit / quota.
+    // Lỗi thật (sai key, network, model lỗi...) → throw ngay, không nuốt.
     async function callLLM(prompt, systemPrompt = "", maxTokens = 1024) {
       if (GROQ_API_KEY) {
         try { return await callGroq(prompt, systemPrompt, maxTokens); }
-        catch (e) { console.warn(`[Fallback 1→2] Groq: ${e.message}`); }
+        catch (e) {
+          if (isRateLimitError(e)) console.warn(`[Fallback 1→2] Groq hết quota → thử OpenRouter`);
+          else throw e;
+        }
       }
       if (OPENROUTER_API_KEY) {
         try { return await callOpenRouter(prompt, systemPrompt, maxTokens); }
-        catch (e) { console.warn(`[Fallback 2→3] OpenRouter: ${e.message}`); }
+        catch (e) {
+          if (isRateLimitError(e)) console.warn(`[Fallback 2→3] OpenRouter hết quota → thử HuggingFace`);
+          else throw e;
+        }
       }
       if (HF_TOKEN) {
         try { return await callHuggingFace(prompt, systemPrompt, maxTokens); }
-        catch (e) { console.warn(`[Fallback 3→4] HuggingFace: ${e.message}`); }
+        catch (e) {
+          if (isRateLimitError(e)) console.warn(`[Fallback 3→4] HuggingFace hết quota → thử NVIDIA`);
+          else throw e;
+        }
       }
       if (NVIDIA_API_KEY) {
         try { return await callNvidia(prompt, systemPrompt, maxTokens); }
-        catch (e) { console.warn(`[Fallback 4→5] NVIDIA: ${e.message}`); }
+        catch (e) {
+          if (isRateLimitError(e)) console.warn(`[Fallback 4→5] NVIDIA hết quota → thử Gemini`);
+          else throw e;
+        }
       }
       console.log("[Fallback] Using Gemini Free as LAST RESORT (limit 20 req/ngày)");
       return await callGemini(prompt, systemPrompt, maxTokens);
