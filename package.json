@@ -1,11 +1,4 @@
 {
   "name": "ai-agent-docs",
-  "version": "1.0.0",
-  "type": "module",
-  "dependencies": {
-    "mammoth": "^1.7.0",
-    "officeparser": "^4.1.0",
-    "pdf-parse": "^1.1.1",
-    "xlsx": "^0.18.5"
-  }
+  "version": "1.0.0"
 }
