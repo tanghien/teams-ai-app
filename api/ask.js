@@ -32,14 +32,14 @@ export default async function handler(req, res) {
     
     const hasAnyLLM = GROQ_API_KEY || OPENROUTER_API_KEY || HF_TOKEN || NVIDIA_API_KEY || GEMINI_API_KEY;
     if (!hasAnyLLM)
-      return res.status(500).json({ error: "Cần ít nhất một API key: GROQ, OPENROUTER, HF, NVIDIA hoặc GEMINI." });
+      return res.status(500).json({ error: "Cần ít nhất một API key free: GROQ, OPENROUTER, HF, NVIDIA hoặc GEMINI." });
 
-    // ─── 3. LLM PROVIDERS ────────────────────────────────────────────────────
+    // ─── 3. LLM PROVIDERS (FREE TIER ONLY) ───────────────────────────────────
     
-    // 🔹 1. Groq — Nhanh nhất, ưu tiên số 1
+    // 🔹 1. Groq — Free tier, nhanh nhất, ưu tiên số 1
     async function callGroq(prompt, systemPrompt = "", maxTokens = 1024) {
       if (!GROQ_API_KEY) throw new Error("NO_GROQ_KEY");
-      console.log("[LLM:1/5] → Calling Groq...");
+      console.log("[LLM:1/5] → Calling Groq (Free)...");
       
       const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST",
@@ -62,7 +62,7 @@ export default async function handler(req, res) {
       if (data.error) {
         const err = new Error(data.error.message || "Groq error");
         err.status = r.status;
-        if (r.status === 429) console.warn("[Groq] RATE LIMIT (429)");
+        if (r.status === 429) console.warn("[Groq] RATE LIMIT (429) — switching to next");
         throw err;
       }
       console.log("[Groq] ✓ Success");
@@ -72,7 +72,7 @@ export default async function handler(req, res) {
     // 🔹 2. OpenRouter — Free models, đa dạng
     async function callOpenRouter(prompt, systemPrompt = "", maxTokens = 1024) {
       if (!OPENROUTER_API_KEY) throw new Error("NO_OPENROUTER_KEY");
-      console.log("[LLM:2/5] → Calling OpenRouter (Free)...");
+      console.log("[LLM:2/5] → Calling OpenRouter (Free models)...");
       
       const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
@@ -103,10 +103,10 @@ export default async function handler(req, res) {
       return data.choices?.[0]?.message?.content?.trim() ?? "";
     }
 
-    // 🔹 3. Hugging Face — Model chuyên biệt
+    // 🔹 3. Hugging Face — Free inference API
     async function callHuggingFace(prompt, systemPrompt = "", maxTokens = 1024) {
       if (!HF_TOKEN) throw new Error("NO_HF_TOKEN");
-      console.log("[LLM:3/5] → Calling Hugging Face...");
+      console.log("[LLM:3/5] → Calling Hugging Face (Free)...");
       
       const r = await fetch("https://router.huggingface.co/v1/chat/completions", {
         method: "POST",
@@ -135,10 +135,10 @@ export default async function handler(req, res) {
       return data.choices?.[0]?.message?.content?.trim() ?? "";
     }
 
-    // 🔹 4. NVIDIA NIM — Backup model Trung Quốc
+    // 🔹 4. NVIDIA NIM — Free tier models
     async function callNvidia(prompt, systemPrompt = "", maxTokens = 1024) {
       if (!NVIDIA_API_KEY) throw new Error("NO_NVIDIA_KEY");
-      console.log("[LLM:4/5] → Calling NVIDIA NIM...");
+      console.log("[LLM:4/5] → Calling NVIDIA NIM (Free)...");
       
       const r = await fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
         method: "POST",
@@ -147,7 +147,7 @@ export default async function handler(req, res) {
           Authorization: `Bearer ${NVIDIA_API_KEY}`
         },
         body: JSON.stringify({
-          model: "thudm/glm-4-7b", // ✅ Model free của NVIDIA
+          model: "thudm/glm-4-7b", // ✅ Model free
           max_tokens: maxTokens,
           temperature: 0.3,
           messages: [
@@ -167,10 +167,10 @@ export default async function handler(req, res) {
       return data.choices?.[0]?.message?.content?.trim() ?? "";
     }
 
-    // 🔹 5. Gemini — Last resort, hỗ trợ Vision
+    // 🔹 5. Gemini Free — Last resort, có Vision nhưng limit rất thấp (20 req/ngày)
     async function callGemini(prompt, systemPrompt = "", maxTokens = 1024) {
       if (!GEMINI_API_KEY) throw new Error("NO_GEMINI_KEY");
-      console.log("[LLM:5/5] → Calling Gemini (last resort)...");
+      console.log("[LLM:5/5] → Calling Gemini Free (LAST RESORT)...");
       
       const r = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
@@ -186,6 +186,11 @@ export default async function handler(req, res) {
       );
       const data = await r.json();
       if (data.error) {
+        // 🔥 Xử lý lỗi quota exceeded để fallback thông báo rõ
+        if (data.error.message?.includes("quota") || r.status === 429) {
+          console.error("[Gemini] QUOTA EXCEEDED — No more free providers available!");
+          throw new Error("HẾT LIMIT TẤT CẢ PROVIDER FREE. Vui lòng thử lại sau hoặc nâng cấp API key.");
+        }
         console.error(`[Gemini] Error: ${data.error.message}`);
         throw new Error(`Gemini error: ${data.error.message}`);
       }
@@ -193,10 +198,10 @@ export default async function handler(req, res) {
       return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
     }
 
-    // 🔹 Gemini Vision — Đọc file PDF/ảnh
+    // 🔹 Gemini Vision Free — Chỉ dùng cho PDF/ảnh, limit 20 req/ngày
     async function callGeminiWithFile(fileBase64, mimeType, prompt, systemPrompt = "") {
       if (!GEMINI_API_KEY) throw new Error("NO_GEMINI_KEY");
-      console.log(`[Vision] → Calling Gemini with file (${mimeType})`);
+      console.log(`[Vision] → Calling Gemini Free with file (${mimeType})`);
       
       const r = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
@@ -211,34 +216,45 @@ export default async function handler(req, res) {
         }
       );
       const data = await r.json();
-      if (data.error) throw new Error(`Gemini Vision error: ${data.error.message}`);
+      if (data.error) {
+        if (data.error.message?.includes("quota") || r.status === 429) {
+          throw new Error("HẾT LIMIT GEMINI FREE (20 req/ngày). Vui lòng dùng file TXT/PDF nhỏ hoặc thử lại sau.");
+        }
+        throw new Error(`Gemini Vision error: ${data.error.message}`);
+      }
       return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
     }
 
-    // ─── FALLBACK CHAIN: 1→2→3→4→5 ─────────────────────────────────────────
+    // ─── FALLBACK CHAIN: 1→2→3→4→5 (chỉ free tier) ──────────────────────────
     async function callLLM(prompt, systemPrompt = "", maxTokens = 1024) {
-      // 1️⃣ Groq
+      // 1️⃣ Groq Free
       if (GROQ_API_KEY) {
         try { return await callGroq(prompt, systemPrompt, maxTokens); }
-        catch (e) { console.warn(`[Fallback 1→2] Groq failed: ${e.message}`); }
+        catch (e) { 
+          if (e.status === 429 || e.message.includes("quota")) {
+            console.warn(`[Fallback 1→2] Groq hết limit → OpenRouter`); 
+          } else {
+            console.warn(`[Fallback 1→2] Groq error: ${e.message}`);
+          }
+        }
       }
-      // 2️⃣ OpenRouter
+      // 2️⃣ OpenRouter Free
       if (OPENROUTER_API_KEY) {
         try { return await callOpenRouter(prompt, systemPrompt, maxTokens); }
-        catch (e) { console.warn(`[Fallback 2→3] OpenRouter failed: ${e.message}`); }
+        catch (e) { console.warn(`[Fallback 2→3] OpenRouter error: ${e.message}`); }
       }
-      // 3️⃣ Hugging Face
+      // 3️⃣ Hugging Face Free
       if (HF_TOKEN) {
         try { return await callHuggingFace(prompt, systemPrompt, maxTokens); }
-        catch (e) { console.warn(`[Fallback 3→4] HuggingFace failed: ${e.message}`); }
+        catch (e) { console.warn(`[Fallback 3→4] HuggingFace error: ${e.message}`); }
       }
-      // 4️⃣ NVIDIA NIM
+      // 4️⃣ NVIDIA NIM Free
       if (NVIDIA_API_KEY) {
         try { return await callNvidia(prompt, systemPrompt, maxTokens); }
-        catch (e) { console.warn(`[Fallback 4→5] NVIDIA failed: ${e.message}`); }
+        catch (e) { console.warn(`[Fallback 4→5] NVIDIA error: ${e.message}`); }
       }
-      // 5️⃣ Gemini (cuối cùng)
-      console.log("[Fallback] Using Gemini as last resort");
+      // 5️⃣ Gemini Free (cuối cùng - dễ hết quota nhất)
+      console.log("[Fallback] Using Gemini Free as LAST RESORT (limit 20 req/ngày)");
       return await callGemini(prompt, systemPrompt, maxTokens);
     }
 
@@ -359,7 +375,7 @@ export default async function handler(req, res) {
       if (!dlRes.ok) {
         answer = `Không tải được file "${selectedFile.name}" (HTTP ${dlRes.status}).`;
       } else if (TEXT_EXTS.includes(ext)) {
-        // Text file: đọc thẳng → gửi LLM chain
+        // ✅ Text file: đọc thẳng → gửi LLM chain (dùng free providers)
         let text = await dlRes.text();
         if (text.length > 15000) text = text.substring(0, 15000) + "\n...[bị cắt bớt]";
         answer = await callLLM(
@@ -367,38 +383,37 @@ export default async function handler(req, res) {
           "Bạn là trợ lý AI tra cứu tài liệu nội bộ. Trả lời ngắn gọn và chính xác bằng tiếng Việt.",
           1024
         );
-        usedProvider = "text->llm-chain";
-      } else if (ext === ".pdf" && GEMINI_API_KEY) {
-        // PDF: Dùng Gemini Vision
+        usedProvider = "text->llm-free-chain";
+      } else if (ext === ".pdf") {
+        // ⚠️ PDF: Chỉ Gemini Free hỗ trợ Vision, nhưng limit rất thấp
         const contentLength = parseInt(dlRes.headers.get("content-length") || "0", 10);
         if (contentLength > 18 * 1024 * 1024) {
-          answer = `File "${selectedFile.name}" quá lớn (${Math.round(contentLength / 1024 / 1024)} MB).`;
-        } else {
+          answer = `File "${selectedFile.name}" quá lớn. Vui lòng dùng file <18MB.`;
+        } else if (GEMINI_API_KEY) {
           const base64 = Buffer.from(await dlRes.arrayBuffer()).toString("base64");
-          answer = await callGeminiWithFile(base64, mimeType, question, "Đọc file PDF và trả lời câu hỏi bằng tiếng Việt.");
-          usedProvider = "gemini-vision-pdf";
-        }
-      } else if ((ext === ".docx" || ext === ".xlsx" || ext === ".xls") && GEMINI_API_KEY) {
-        // Office: Gemini Vision hỗ trợ một số định dạng
-        const contentLength = parseInt(dlRes.headers.get("content-length") || "0", 10);
-        if (contentLength > 18 * 1024 * 1024) {
-          answer = `File "${selectedFile.name}" quá lớn. Vui lòng chuyển sang PDF.`;
+          try {
+            answer = await callGeminiWithFile(base64, mimeType, question, "Đọc file PDF và trả lời câu hỏi bằng tiếng Việt.");
+            usedProvider = "gemini-vision-free";
+          } catch (e) {
+            answer = `Gemini Free hết quota. ${e.message}`;
+          }
         } else {
-          const base64 = Buffer.from(await dlRes.arrayBuffer()).toString("base64");
-          answer = await callGeminiWithFile(base64, mimeType, question, "Đọc nội dung file và trả lời bằng tiếng Việt.");
-          usedProvider = "gemini-vision-office";
+          answer = `File PDF cần Gemini để đọc, nhưng chưa cấu hình GEMINI_API_KEY.`;
         }
+      } else if (ext === ".docx" || ext === ".xlsx" || ext === ".xls") {
+        // ⚠️ Office: Gemini Free hỗ trợ hạn chế, ưu tiên chuyển sang PDF/TXT
+        answer = `File ${ext} chưa được hỗ trợ đọc miễn phí. Vui lòng chuyển sang PDF hoặc TXT để tra cứu.`;
       } else {
-        answer = `Định dạng ${ext} chưa được hỗ trợ. Vui lòng chuyển sang PDF hoặc TXT.`;
+        answer = `Định dạng ${ext} chưa được hỗ trợ. Vui lòng dùng file TXT hoặc PDF.`;
       }
     } else {
-      // Không tìm thấy file phù hợp → gợi ý bằng LLM chain
+      // Không tìm thấy file phù hợp → gợi ý bằng LLM chain free
       answer = await callLLM(
         `Câu hỏi: "${question}"\n\nDanh sách file hiện có:\n${fileList.substring(0, 3000)}`,
         "Không tìm thấy file phù hợp. Hãy gợi ý người dùng nên tìm trong file nào dựa trên danh sách.",
         512
       );
-      usedProvider = "fallback-llm-chain";
+      usedProvider = "fallback-llm-free-chain";
     }
 
     return res.status(200).json({
@@ -407,12 +422,17 @@ export default async function handler(req, res) {
         fileSelected: selectedFile ? `${selectedFile.path}/${selectedFile.name}` : null,
         totalFiles: allFiles.length,
         library: targetDrive.name,
-        provider: usedProvider
+        provider: usedProvider,
+        note: "Đang dùng 100% free tier. Gemini Free chỉ 20 req/ngày — ưu tiên dùng Groq/OpenRouter."
       }
     });
 
   } catch (err) {
     console.error("[ask.js] Unhandled error:", err);
-    return res.status(500).json({ crash: true, message: err.message ?? "Unknown error" });
+    return res.status(500).json({ 
+      crash: true, 
+      message: err.message ?? "Unknown error",
+      tip: "Nếu lỗi 'quota exceeded': đợi reset lúc 00:00 UTC hoặc thêm API key free khác vào .env"
+    });
   }
 }
