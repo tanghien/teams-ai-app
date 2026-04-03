@@ -29,6 +29,7 @@ export default async function handler(req, res) {
       AZURE_CLIENT_ID,
       AZURE_CLIENT_SECRET,
       GROQ_API_KEY,
+      DEEPSEEK_API_KEY,
       GEMINI_API_KEY,
       OPENROUTER_API_KEY,
       HF_TOKEN,
@@ -38,7 +39,7 @@ export default async function handler(req, res) {
     if (!AZURE_TENANT_ID || !AZURE_CLIENT_ID || !AZURE_CLIENT_SECRET)
       return res.status(500).json({ error: "Thiếu biến môi trường Azure." });
 
-    const hasAnyLLM = GROQ_API_KEY || OPENROUTER_API_KEY || HF_TOKEN || NVIDIA_API_KEY || GEMINI_API_KEY;
+    const hasAnyLLM = GROQ_API_KEY || DEEPSEEK_API_KEY || OPENROUTER_API_KEY || HF_TOKEN || NVIDIA_API_KEY || GEMINI_API_KEY;
     if (!hasAnyLLM)
       return res.status(500).json({ error: "Cần ít nhất một API key free: GROQ, OPENROUTER, HF, NVIDIA hoặc GEMINI." });
 
@@ -90,7 +91,35 @@ export default async function handler(req, res) {
       return data.choices?.[0]?.message?.content?.trim() ?? "";
     }
 
-    // 🔹 2. OpenRouter — Free models
+    // 🔹 2. DeepSeek — 5M token free khi đăng ký, không rate limit cứng
+    async function callDeepSeek(prompt, systemPrompt = "", maxTokens = 1024) {
+      if (!DEEPSEEK_API_KEY) throw new Error("NO_DEEPSEEK_KEY");
+      console.log("[LLM:2/6] → Calling DeepSeek (Free 5M tokens)...");
+      const r = await fetch("https://api.deepseek.com/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+        body: JSON.stringify({
+          model: "deepseek-chat", // DeepSeek-V3.2, 128K context
+          max_tokens: maxTokens,
+          temperature: 0.3,
+          messages: [
+            ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+            { role: "user", content: prompt }
+          ]
+        })
+      });
+      const data = await r.json();
+      if (data.error) {
+        const err = new Error(data.error.message || "DeepSeek error");
+        err.status = r.status;
+        console.warn(`[DeepSeek] Error: ${err.message}`);
+        throw err;
+      }
+      console.log("[DeepSeek] ✓ Success");
+      return data.choices?.[0]?.message?.content?.trim() ?? "";
+    }
+
+    // 🔹 3. OpenRouter — Free models
     // Thử lần lượt: openrouter/free (auto-router) → deepseek-r1 → llama-4-maverick → qwen3
     async function callOpenRouter(prompt, systemPrompt = "", maxTokens = 1024) {
       if (!OPENROUTER_API_KEY) throw new Error("NO_OPENROUTER_KEY");
@@ -153,32 +182,57 @@ export default async function handler(req, res) {
       throw new Error("Tất cả OpenRouter free models đều không khả dụng.");
     }
 
-    // 🔹 3. Hugging Face — Free inference API
+    // 🔹 3. Hugging Face — Free inference API (thử lần lượt các model)
     async function callHuggingFace(prompt, systemPrompt = "", maxTokens = 1024) {
       if (!HF_TOKEN) throw new Error("NO_HF_TOKEN");
-      console.log("[LLM:3/5] → Calling Hugging Face (Free)...");
-      const r = await fetch("https://router.huggingface.co/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${HF_TOKEN}` },
-        body: JSON.stringify({
-          model: "meta-llama/Llama-3.1-8B-Instruct:fastest",
-          max_tokens: maxTokens,
-          temperature: 0.3,
-          messages: [
-            ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
-            { role: "user", content: prompt }
-          ]
-        })
-      });
-      const data = await r.json();
-      if (data.error) {
-        const err = new Error(data.error.message || "Hugging Face error");
-        err.status = r.status;
-        console.warn(`[HuggingFace] Error: ${err.message}`);
-        throw err;
+
+      const HF_MODELS = [
+        "meta-llama/Llama-3.1-8B-Instruct",          // stable, không có :fastest
+        "meta-llama/Llama-3.2-3B-Instruct",           // nhỏ hơn, nhanh hơn
+        "Qwen/Qwen2.5-7B-Instruct",                   // backup tốt
+        "mistralai/Mistral-7B-Instruct-v0.3",         // ổn định lâu dài
+      ];
+
+      const headers = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${HF_TOKEN}`
+      };
+
+      for (const model of HF_MODELS) {
+        console.log(`[LLM:3/5] → HuggingFace trying model: ${model}`);
+        try {
+          const r = await fetch("https://router.huggingface.co/v1/chat/completions", {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              model,
+              max_tokens: maxTokens,
+              temperature: 0.3,
+              messages: [
+                ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+                { role: "user", content: prompt }
+              ]
+            })
+          });
+          const data = await r.json();
+          if (data.error) {
+            const msg = data.error.message || "HuggingFace error";
+            // Rate limit → throw lên callLLM để fallback sang NVIDIA
+            if (isRateLimitError({ message: msg, status: r.status })) throw Object.assign(new Error(msg), { status: r.status });
+            // Model không khả dụng / lỗi endpoint → thử model tiếp
+            console.warn(`[HuggingFace] Model ${model} error: ${msg} → trying next`);
+            continue;
+          }
+          const text = data.choices?.[0]?.message?.content?.trim() ?? "";
+          if (!text) { console.warn(`[HuggingFace] Empty response from ${model} → trying next`); continue; }
+          console.log(`[HuggingFace] ✓ Success via ${model}`);
+          return text;
+        } catch (e) {
+          if (isRateLimitError(e)) throw e; // rate limit → callLLM xử lý fallback
+          console.warn(`[HuggingFace] ${model} error: ${e.message} → trying next`);
+        }
       }
-      console.log("[HuggingFace] ✓ Success");
-      return data.choices?.[0]?.message?.content?.trim() ?? "";
+      throw new Error("Tất cả HuggingFace models đều không khả dụng.");
     }
 
     // 🔹 4. NVIDIA NIM — Free tier
@@ -240,53 +294,62 @@ export default async function handler(req, res) {
 
     // 🔀 Fallback chain theo thứ tự tối ưu:
     //   1. Groq llama-3.3-70b-versatile — mạnh, TPM cao hơn 8b, context lớn
-    //   2. Groq llama-3.1-8b-instant    — nhanh, 14,400 req/ngày nhưng TPM chỉ 6000
-    //   3. HuggingFace                  — ổn định, limit không cố định
-    //   4. NVIDIA NIM                   — backup
-    //   5. OpenRouter/free              — auto-router, 200 req/ngày (để dành, hay bị lỗi endpoint)
-    //   6. Gemini Free                  — last resort, 20 req/ngày
+    //   2. DeepSeek deepseek-chat       — 5M token free, không rate limit cứng, 128K context
+    //   3. Groq llama-3.1-8b-instant    — nhanh, 14,400 req/ngày nhưng TPM chỉ 6000
+    //   4. HuggingFace                  — ổn định, limit không cố định
+    //   5. NVIDIA NIM                   — backup
+    //   6. OpenRouter/free              — auto-router, 200 req/ngày (để dành, hay bị lỗi endpoint)
+    //   7. Gemini Free                  — last resort, 20 req/ngày
     async function callLLM(prompt, systemPrompt = "", maxTokens = 1024) {
       // 1️⃣ Groq llama-3.3-70b-versatile: TPM cao hơn 8b, xử lý tốt file lớn
       if (GROQ_API_KEY) {
         try { return await callGroq(prompt, systemPrompt, maxTokens, "llama-3.3-70b-versatile"); }
         catch (e) {
-          if (isRateLimitError(e)) console.warn("[Fallback 1→2] Groq 70b hết quota/TPM → thử Groq 8b");
+          if (isRateLimitError(e)) console.warn("[Fallback 1→2] Groq 70b hết quota/TPM → thử DeepSeek");
           else throw e;
         }
       }
-      // 2️⃣ Groq llama-3.1-8b-instant: 14,400 req/ngày — tốt cho prompt ngắn/vừa
+      // 2️⃣ DeepSeek: 5M token free, không rate limit cứng, context 128K — rất phù hợp file lớn
+      if (DEEPSEEK_API_KEY) {
+        try { return await callDeepSeek(prompt, systemPrompt, maxTokens); }
+        catch (e) {
+          if (isRateLimitError(e)) console.warn("[Fallback 2→3] DeepSeek hết token free → thử Groq 8b");
+          else throw e;
+        }
+      }
+      // 3️⃣ Groq llama-3.1-8b-instant: 14,400 req/ngày — tốt cho prompt ngắn/vừa
       if (GROQ_API_KEY) {
         try { return await callGroq(prompt, systemPrompt, maxTokens, "llama-3.1-8b-instant"); }
         catch (e) {
-          if (isRateLimitError(e)) console.warn("[Fallback 2→3] Groq 8b hết quota/TPM → thử HuggingFace");
+          if (isRateLimitError(e)) console.warn("[Fallback 3→4] Groq 8b hết quota/TPM → thử HuggingFace");
           else throw e;
         }
       }
-      // 3️⃣ HuggingFace: ổn định, không có hard limit/ngày rõ ràng
+      // 4️⃣ HuggingFace: ổn định, không có hard limit/ngày rõ ràng
       if (HF_TOKEN) {
         try { return await callHuggingFace(prompt, systemPrompt, maxTokens); }
         catch (e) {
-          if (isRateLimitError(e)) console.warn("[Fallback 3→4] HuggingFace hết quota → thử NVIDIA");
+          if (isRateLimitError(e)) console.warn("[Fallback 4→5] HuggingFace hết quota → thử NVIDIA");
           else throw e;
         }
       }
-      // 4️⃣ NVIDIA NIM: backup tốt, limit ~1000 req/tháng
+      // 5️⃣ NVIDIA NIM: backup tốt, limit ~1000 req/tháng
       if (NVIDIA_API_KEY) {
         try { return await callNvidia(prompt, systemPrompt, maxTokens); }
         catch (e) {
-          if (isRateLimitError(e)) console.warn("[Fallback 4→5] NVIDIA hết quota → thử OpenRouter");
+          if (isRateLimitError(e)) console.warn("[Fallback 5→6] NVIDIA hết quota → thử OpenRouter");
           else throw e;
         }
       }
-      // 5️⃣ OpenRouter: để dành gần cuối vì hay gặp lỗi endpoint, 200 req/ngày
+      // 6️⃣ OpenRouter: để dành gần cuối vì hay gặp lỗi endpoint, 200 req/ngày
       if (OPENROUTER_API_KEY) {
         try { return await callOpenRouter(prompt, systemPrompt, maxTokens); }
         catch (e) {
-          if (isRateLimitError(e)) console.warn("[Fallback 5→6] OpenRouter hết quota → thử Gemini");
+          if (isRateLimitError(e)) console.warn("[Fallback 6→7] OpenRouter hết quota → thử Gemini");
           else throw e;
         }
       }
-      // 6️⃣ Gemini Free: LAST RESORT — chỉ 20 req/ngày, tiết kiệm tối đa
+      // 7️⃣ Gemini Free: LAST RESORT — chỉ 20 req/ngày, tiết kiệm tối đa
       console.warn("[Fallback] Gemini Free LAST RESORT (20 req/ngày) — tất cả provider khác đã hết quota");
       return await callGemini(prompt, systemPrompt, maxTokens);
     }
