@@ -18,11 +18,35 @@ export default async function handler(req, res) {
     }
 
     // ─── Env ─────────────────────────────────────────────────────────────────────
-    const { AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, GROQ_API_KEY } = process.env;
+    const { AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, GEMINI_API_KEY } = process.env;
     if (!AZURE_TENANT_ID || !AZURE_CLIENT_ID || !AZURE_CLIENT_SECRET)
       return res.status(500).json({ error: "Thiếu biến môi trường Azure." });
-    if (!GROQ_API_KEY)
-      return res.status(500).json({ error: "Thiếu biến môi trường GROQ_API_KEY." });
+    if (!GEMINI_API_KEY)
+      return res.status(500).json({ error: "Thiếu biến môi trường GEMINI_API_KEY." });
+
+    // ─── Helper: gọi Gemini ──────────────────────────────────────────────────────
+    async function callGemini(prompt, systemPrompt = "", maxTokens = 1024) {
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...(systemPrompt && {
+              system_instruction: { parts: [{ text: systemPrompt }] },
+            }),
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+              maxOutputTokens: maxTokens,
+              temperature: 0.3,
+            },
+          }),
+        }
+      );
+      const data = await r.json();
+      if (data.error) throw new Error(`Gemini error: ${data.error.message}`);
+      return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
+    }
 
     // ─── 1. Access Token ─────────────────────────────────────────────────────────
     const tokenRes = await fetch(
@@ -108,32 +132,17 @@ export default async function handler(req, res) {
       });
     }
 
-    // ─── 5. Groq chọn file liên quan nhất ────────────────────────────────────────
+    // ─── 5. Gemini chọn file liên quan nhất ──────────────────────────────────────
     const fileList = allFiles
       .map((f, i) => `${i + 1}. [${f.path || "/"}] ${f.name} (${Math.round(f.size / 1024)} KB)`)
       .join("\n");
 
-    const selectRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_API_KEY}` },
-      body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
-        max_tokens: 50,
-        temperature: 0,
-        messages: [
-          {
-            role: "system",
-            content: "Chọn file liên quan nhất đến câu hỏi. Trả lời CHỈ bằng số thứ tự (ví dụ: 5). Nếu không có file liên quan, trả lời: 0.",
-          },
-          {
-            role: "user",
-            content: `Câu hỏi: "${question}"\n\nDanh sách file:\n${fileList}`,
-          },
-        ],
-      }),
-    });
-    const selectData = await selectRes.json();
-    const selectedIndex = parseInt((selectData.choices?.[0]?.message?.content ?? "0").trim(), 10);
+    const selectedIndexStr = await callGemini(
+      `Câu hỏi: "${question}"\n\nDanh sách file:\n${fileList}`,
+      "Chọn file liên quan nhất đến câu hỏi. Trả lời CHỈ bằng số thứ tự (ví dụ: 5). Nếu không có file liên quan, trả lời: 0.",
+      50
+    );
+    const selectedIndex = parseInt(selectedIndexStr.trim(), 10);
 
     // ─── 6. Download và extract nội dung file ────────────────────────────────────
     let fileContent = "";
@@ -143,7 +152,6 @@ export default async function handler(req, res) {
       selectedFile = allFiles[selectedIndex - 1];
       const ext = selectedFile.name.substring(selectedFile.name.lastIndexOf(".")).toLowerCase();
 
-      // Download binary từ SharePoint
       const dlRes = await fetch(
         `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${selectedFile.id}/content`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -153,11 +161,9 @@ export default async function handler(req, res) {
         fileContent = `[Không tải được file: ${selectedFile.name} — HTTP ${dlRes.status}]`;
 
       } else if ([".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm", ".log"].includes(ext)) {
-        // ── Text thuần ───────────────────────────────────────────────────────────
         fileContent = await dlRes.text();
 
       } else if (ext === ".pdf") {
-        // ── PDF: extract text bằng pdf-parse ────────────────────────────────────
         try {
           const pdfParse = (await import("pdf-parse/lib/pdf-parse.js")).default;
           const buffer = Buffer.from(await dlRes.arrayBuffer());
@@ -168,7 +174,6 @@ export default async function handler(req, res) {
         }
 
       } else if (ext === ".docx") {
-        // ── DOCX: extract text bằng mammoth ─────────────────────────────────────
         try {
           const mammoth = (await import("mammoth")).default;
           const buffer = Buffer.from(await dlRes.arrayBuffer());
@@ -179,7 +184,6 @@ export default async function handler(req, res) {
         }
 
       } else if (ext === ".xlsx" || ext === ".xls") {
-        // ── XLSX: đọc bằng SheetJS ───────────────────────────────────────────────
         try {
           const XLSX = (await import("xlsx")).default;
           const buffer = Buffer.from(await dlRes.arrayBuffer());
@@ -187,8 +191,7 @@ export default async function handler(req, res) {
           const lines = [];
           for (const sheetName of workbook.SheetNames) {
             const sheet = workbook.Sheets[sheetName];
-            const csv = XLSX.utils.sheet_to_csv(sheet);
-            lines.push(`=== Sheet: ${sheetName} ===\n${csv}`);
+            lines.push(`=== Sheet: ${sheetName} ===\n${XLSX.utils.sheet_to_csv(sheet)}`);
           }
           fileContent = lines.join("\n\n").trim() || `[XLSX: ${selectedFile.name} — không có dữ liệu]`;
         } catch (e) {
@@ -196,7 +199,6 @@ export default async function handler(req, res) {
         }
 
       } else if (ext === ".pptx") {
-        // ── PPTX: extract text bằng officeparser ────────────────────────────────
         try {
           const officeParser = (await import("officeparser")).default;
           const buffer = Buffer.from(await dlRes.arrayBuffer());
@@ -209,37 +211,20 @@ export default async function handler(req, res) {
         fileContent = `[Định dạng ${ext} chưa hỗ trợ: ${selectedFile.name}]`;
       }
 
-      // Giới hạn độ dài context gửi cho Groq
-      if (fileContent.length > 10000)
-        fileContent = fileContent.substring(0, 10000) + "\n...[nội dung bị cắt bớt]";
+      // Giới hạn context — Gemini chịu được nhiều hơn Groq
+      if (fileContent.length > 30000)
+        fileContent = fileContent.substring(0, 30000) + "\n...[nội dung bị cắt bớt]";
     }
 
-    // ─── 7. Groq trả lời ─────────────────────────────────────────────────────────
+    // ─── 7. Gemini trả lời ────────────────────────────────────────────────────────
     const contextText = fileContent ||
-      `Không tìm thấy file phù hợp.\n\nCác file hiện có (${allFiles.length} file):\n${fileList.substring(0, 3000)}`;
+      `Không tìm thấy file phù hợp.\n\nCác file hiện có (${allFiles.length} file):\n${fileList.substring(0, 5000)}`;
 
-    const answerRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_API_KEY}` },
-      body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
-        max_tokens: 1024,
-        temperature: 0.3,
-        messages: [
-          {
-            role: "system",
-            content: "Bạn là trợ lý AI tra cứu tài liệu nội bộ l. Trả lời bằng ngắn gọn và chính xác dựa trên nội dung tài liệu. Nếu không đủ thông tin, hãy nói rõ.",
-          },
-          {
-            role: "user",
-            content: `Nội dung tài liệu:\n\n${contextText}\n\n---\n\nCâu hỏi: ${question}`,
-          },
-        ],
-      }),
-    });
-
-    const answerData = await answerRes.json();
-    const answer = answerData.choices?.[0]?.message?.content ?? "Không nhận được câu trả lời từ Groq.";
+    const answer = await callGemini(
+      `Nội dung tài liệu:\n\n${contextText}\n\n---\n\nCâu hỏi: ${question}`,
+      "Bạn là trợ lý AI tra cứu tài liệu nội bộ. Trả lời ngắn gọn và chính xác dựa trên nội dung tài liệu. Nếu không đủ thông tin, hãy nói rõ.",
+      1024
+    ) || "Không nhận được câu trả lời.";
 
     // ─── 8. Response ─────────────────────────────────────────────────────────────
     return res.status(200).json({
