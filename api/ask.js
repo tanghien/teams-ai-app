@@ -75,36 +75,66 @@ export default async function handler(req, res) {
     }
 
     // 🔹 2. OpenRouter — Free models
+    // Thử lần lượt: openrouter/free (auto-router) → deepseek-r1 → llama-4-maverick → qwen3
     async function callOpenRouter(prompt, systemPrompt = "", maxTokens = 1024) {
       if (!OPENROUTER_API_KEY) throw new Error("NO_OPENROUTER_KEY");
-      console.log("[LLM:2/5] → Calling OpenRouter (Free models)...");
-      const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-          "HTTP-Referer": "https://yourdomain.com",
-          "X-Title": "AI Docs Agent"
-        },
-        body: JSON.stringify({
-          model: "meta-llama/llama-3-8b-instruct:free",
-          max_tokens: maxTokens,
-          temperature: 0.3,
-          messages: [
-            ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
-            { role: "user", content: prompt }
-          ]
-        })
-      });
-      const data = await r.json();
-      if (data.error) {
-        const err = new Error(data.error.message || "OpenRouter error");
-        err.status = r.status;
-        console.warn(`[OpenRouter] Error: ${err.message}`);
-        throw err;
+
+      // openrouter/free: tự động chọn model free đang hoạt động — không bao giờ bị "No endpoints"
+      const OR_MODELS = [
+        "openrouter/free",                    // auto-router, ưu tiên số 1
+        "deepseek/deepseek-r1:free",          // fallback 1
+        "meta-llama/llama-4-maverick:free",   // fallback 2
+        "qwen/qwen3-235b-a22b:free",          // fallback 3
+        "deepseek/deepseek-chat-v3.1:free",   // fallback 4
+      ];
+
+      const headers = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        "HTTP-Referer": "https://yourdomain.com",
+        "X-Title": "AI Docs Agent"
+      };
+
+      for (const model of OR_MODELS) {
+        console.log(`[LLM:2/5] → OpenRouter trying model: ${model}`);
+        try {
+          const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              model,
+              max_tokens: maxTokens,
+              temperature: 0.3,
+              messages: [
+                ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+                { role: "user", content: prompt }
+              ]
+            })
+          });
+          const data = await r.json();
+          if (data.error) {
+            const msg = data.error.message || "OpenRouter error";
+            // Lỗi "No endpoints" hoặc model không tồn tại → thử model tiếp theo
+            if (msg.toLowerCase().includes("no endpoints") || msg.toLowerCase().includes("not found")) {
+              console.warn(`[OpenRouter] Model ${model} unavailable → trying next`);
+              continue;
+            }
+            const err = new Error(msg);
+            err.status = r.status;
+            throw err;
+          }
+          const content = data.choices?.[0]?.message?.content?.trim() ?? "";
+          if (!content) { console.warn(`[OpenRouter] Empty response from ${model} → trying next`); continue; }
+          console.log(`[OpenRouter] ✓ Success via ${model}`);
+          return content;
+        } catch (e) {
+          // Nếu là lỗi rate limit → throw lên callLLM để fallback sang HuggingFace
+          if (isRateLimitError(e)) throw e;
+          // Lỗi khác → thử model tiếp theo trong list
+          console.warn(`[OpenRouter] ${model} error: ${e.message} → trying next`);
+        }
       }
-      console.log("[OpenRouter] ✓ Success");
-      return data.choices?.[0]?.message?.content?.trim() ?? "";
+      throw new Error("Tất cả OpenRouter free models đều không khả dụng.");
     }
 
     // 🔹 3. Hugging Face — Free inference API
