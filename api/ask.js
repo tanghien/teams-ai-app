@@ -43,9 +43,8 @@ export default async function handler(req, res) {
     if (!hasAnyLLM)
       return res.status(500).json({ error: "Cần ít nhất một API key free: GROQ, OPENROUTER, HF, NVIDIA hoặc GEMINI." });
 
-    // ─── 3. LLM PROVIDERS (FREE TIER — FALLBACK CHAIN 1→2→3→4→5) ────────────
+    // ─── 3. LLM PROVIDERS ────────────────────────────────────────────────────
 
-    // 🔍 Chỉ fallback khi đúng lỗi rate limit / quota — lỗi thật thì throw luôn
     function isRateLimitError(e) {
       return (
         e.status === 429 ||
@@ -54,17 +53,15 @@ export default async function handler(req, res) {
         e.message?.toLowerCase().includes("rate_limit") ||
         e.message?.toLowerCase().includes("too many") ||
         e.message?.toLowerCase().includes("exceeded") ||
-        e.message?.toLowerCase().includes("request too large") ||  // token vượt TPM limit
-        e.message?.toLowerCase().includes("reduce your message")   // Groq TPM message
+        e.message?.toLowerCase().includes("request too large") ||
+        e.message?.toLowerCase().includes("reduce your message")
       );
     }
 
-    // 🔹 1. Groq — Free tier, nhanh nhất, ưu tiên số 1
-    // model mặc định: llama-3.1-8b-instant (14,400 req/ngày)
-    // model thứ 2:   llama-3.3-70b-versatile (mạnh hơn, RPD thấp hơn)
+    // 🔹 1. Groq
     async function callGroq(prompt, systemPrompt = "", maxTokens = 1024, model = "llama-3.1-8b-instant") {
       if (!GROQ_API_KEY) throw new Error("NO_GROQ_KEY");
-      console.log("[LLM:1/5] → Calling Groq (Free)...");
+      console.log(`[LLM] → Groq (${model})...`);
       const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_API_KEY}` },
@@ -91,15 +88,15 @@ export default async function handler(req, res) {
       return data.choices?.[0]?.message?.content?.trim() ?? "";
     }
 
-    // 🔹 2. DeepSeek — 5M token free khi đăng ký, không rate limit cứng
+    // 🔹 2. DeepSeek
     async function callDeepSeek(prompt, systemPrompt = "", maxTokens = 1024) {
       if (!DEEPSEEK_API_KEY) throw new Error("NO_DEEPSEEK_KEY");
-      console.log("[LLM:2/6] → Calling DeepSeek (Free 5M tokens)...");
+      console.log("[LLM] → DeepSeek (Free 5M tokens)...");
       const r = await fetch("https://api.deepseek.com/chat/completions", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
         body: JSON.stringify({
-          model: "deepseek-chat", // DeepSeek-V3.2, 128K context
+          model: "deepseek-chat",
           max_tokens: maxTokens,
           temperature: 0.3,
           messages: [
@@ -119,126 +116,10 @@ export default async function handler(req, res) {
       return data.choices?.[0]?.message?.content?.trim() ?? "";
     }
 
-    // 🔹 3. OpenRouter — Free models
-    // Thử lần lượt: openrouter/free (auto-router) → deepseek-r1 → llama-4-maverick → qwen3
-    async function callOpenRouter(prompt, systemPrompt = "", maxTokens = 1024) {
-      if (!OPENROUTER_API_KEY) throw new Error("NO_OPENROUTER_KEY");
-
-      // openrouter/free: tự động chọn model free đang hoạt động — không bao giờ bị "No endpoints"
-      const OR_MODELS = [
-        "openrouter/free",                    // auto-router, ưu tiên số 1
-        "deepseek/deepseek-r1:free",          // fallback 1
-        "meta-llama/llama-4-maverick:free",   // fallback 2
-        "qwen/qwen3-235b-a22b:free",          // fallback 3
-        "deepseek/deepseek-chat-v3.1:free",   // fallback 4
-      ];
-
-      const headers = {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-        "HTTP-Referer": "https://yourdomain.com",
-        "X-Title": "AI Docs Agent"
-      };
-
-      for (const model of OR_MODELS) {
-        console.log(`[LLM:2/5] → OpenRouter trying model: ${model}`);
-        try {
-          const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-            method: "POST",
-            headers,
-            body: JSON.stringify({
-              model,
-              max_tokens: maxTokens,
-              temperature: 0.3,
-              messages: [
-                ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
-                { role: "user", content: prompt }
-              ]
-            })
-          });
-          const data = await r.json();
-          if (data.error) {
-            const msg = data.error.message || "OpenRouter error";
-            // Lỗi "No endpoints" hoặc model không tồn tại → thử model tiếp theo
-            if (msg.toLowerCase().includes("no endpoints") || msg.toLowerCase().includes("not found")) {
-              console.warn(`[OpenRouter] Model ${model} unavailable → trying next`);
-              continue;
-            }
-            const err = new Error(msg);
-            err.status = r.status;
-            throw err;
-          }
-          const content = data.choices?.[0]?.message?.content?.trim() ?? "";
-          if (!content) { console.warn(`[OpenRouter] Empty response from ${model} → trying next`); continue; }
-          console.log(`[OpenRouter] ✓ Success via ${model}`);
-          return content;
-        } catch (e) {
-          // Nếu là lỗi rate limit → throw lên callLLM để fallback sang HuggingFace
-          if (isRateLimitError(e)) throw e;
-          // Lỗi khác → thử model tiếp theo trong list
-          console.warn(`[OpenRouter] ${model} error: ${e.message} → trying next`);
-        }
-      }
-      throw new Error("Tất cả OpenRouter free models đều không khả dụng.");
-    }
-
-    // 🔹 3. Hugging Face — Free inference API (thử lần lượt các model)
-    async function callHuggingFace(prompt, systemPrompt = "", maxTokens = 1024) {
-      if (!HF_TOKEN) throw new Error("NO_HF_TOKEN");
-
-      const HF_MODELS = [
-        "meta-llama/Llama-3.1-8B-Instruct",          // stable, không có :fastest
-        "meta-llama/Llama-3.2-3B-Instruct",           // nhỏ hơn, nhanh hơn
-        "Qwen/Qwen2.5-7B-Instruct",                   // backup tốt
-        "mistralai/Mistral-7B-Instruct-v0.3",         // ổn định lâu dài
-      ];
-
-      const headers = {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${HF_TOKEN}`
-      };
-
-      for (const model of HF_MODELS) {
-        console.log(`[LLM:3/5] → HuggingFace trying model: ${model}`);
-        try {
-          const r = await fetch("https://router.huggingface.co/v1/chat/completions", {
-            method: "POST",
-            headers,
-            body: JSON.stringify({
-              model,
-              max_tokens: maxTokens,
-              temperature: 0.3,
-              messages: [
-                ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
-                { role: "user", content: prompt }
-              ]
-            })
-          });
-          const data = await r.json();
-          if (data.error) {
-            const msg = data.error.message || "HuggingFace error";
-            // Rate limit → throw lên callLLM để fallback sang NVIDIA
-            if (isRateLimitError({ message: msg, status: r.status })) throw Object.assign(new Error(msg), { status: r.status });
-            // Model không khả dụng / lỗi endpoint → thử model tiếp
-            console.warn(`[HuggingFace] Model ${model} error: ${msg} → trying next`);
-            continue;
-          }
-          const text = data.choices?.[0]?.message?.content?.trim() ?? "";
-          if (!text) { console.warn(`[HuggingFace] Empty response from ${model} → trying next`); continue; }
-          console.log(`[HuggingFace] ✓ Success via ${model}`);
-          return text;
-        } catch (e) {
-          if (isRateLimitError(e)) throw e; // rate limit → callLLM xử lý fallback
-          console.warn(`[HuggingFace] ${model} error: ${e.message} → trying next`);
-        }
-      }
-      throw new Error("Tất cả HuggingFace models đều không khả dụng.");
-    }
-
-    // 🔹 4. NVIDIA NIM — Free tier
+    // 🔹 3. NVIDIA NIM — đưa lên vị trí 4 để test
     async function callNvidia(prompt, systemPrompt = "", maxTokens = 1024) {
       if (!NVIDIA_API_KEY) throw new Error("NO_NVIDIA_KEY");
-      console.log("[LLM:4/5] → Calling NVIDIA NIM (Free)...");
+      console.log("[LLM] → NVIDIA NIM (Free)...");
       const r = await fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${NVIDIA_API_KEY}` },
@@ -263,10 +144,119 @@ export default async function handler(req, res) {
       return data.choices?.[0]?.message?.content?.trim() ?? "";
     }
 
-    // 🔹 5. Gemini Free — Last resort (20 req/ngày, text only)
+    // 🔹 4. HuggingFace
+    async function callHuggingFace(prompt, systemPrompt = "", maxTokens = 1024) {
+      if (!HF_TOKEN) throw new Error("NO_HF_TOKEN");
+
+      const HF_MODELS = [
+        "meta-llama/Llama-3.1-8B-Instruct",
+        "meta-llama/Llama-3.2-3B-Instruct",
+        "Qwen/Qwen2.5-7B-Instruct",
+        "mistralai/Mistral-7B-Instruct-v0.3",
+      ];
+
+      const headers = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${HF_TOKEN}`
+      };
+
+      for (const model of HF_MODELS) {
+        console.log(`[LLM] → HuggingFace (${model})...`);
+        try {
+          const r = await fetch("https://router.huggingface.co/v1/chat/completions", {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              model,
+              max_tokens: maxTokens,
+              temperature: 0.3,
+              messages: [
+                ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+                { role: "user", content: prompt }
+              ]
+            })
+          });
+          const data = await r.json();
+          if (data.error) {
+            const msg = data.error.message || "HuggingFace error";
+            if (isRateLimitError({ message: msg, status: r.status })) throw Object.assign(new Error(msg), { status: r.status });
+            console.warn(`[HuggingFace] ${model} error: ${msg} → trying next`);
+            continue;
+          }
+          const text = data.choices?.[0]?.message?.content?.trim() ?? "";
+          if (!text) { console.warn(`[HuggingFace] Empty response from ${model} → trying next`); continue; }
+          console.log(`[HuggingFace] ✓ Success via ${model}`);
+          return text;
+        } catch (e) {
+          if (isRateLimitError(e)) throw e;
+          console.warn(`[HuggingFace] ${model} error: ${e.message} → trying next`);
+        }
+      }
+      throw new Error("Tất cả HuggingFace models đều không khả dụng.");
+    }
+
+    // 🔹 5. OpenRouter
+    async function callOpenRouter(prompt, systemPrompt = "", maxTokens = 1024) {
+      if (!OPENROUTER_API_KEY) throw new Error("NO_OPENROUTER_KEY");
+
+      const OR_MODELS = [
+        "openrouter/free",
+        "deepseek/deepseek-r1:free",
+        "meta-llama/llama-4-maverick:free",
+        "qwen/qwen3-235b-a22b:free",
+        "deepseek/deepseek-chat-v3.1:free",
+      ];
+
+      const headers = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        "HTTP-Referer": "https://yourdomain.com",
+        "X-Title": "AI Docs Agent"
+      };
+
+      for (const model of OR_MODELS) {
+        console.log(`[LLM] → OpenRouter (${model})...`);
+        try {
+          const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              model,
+              max_tokens: maxTokens,
+              temperature: 0.3,
+              messages: [
+                ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+                { role: "user", content: prompt }
+              ]
+            })
+          });
+          const data = await r.json();
+          if (data.error) {
+            const msg = data.error.message || "OpenRouter error";
+            if (msg.toLowerCase().includes("no endpoints") || msg.toLowerCase().includes("not found")) {
+              console.warn(`[OpenRouter] Model ${model} unavailable → trying next`);
+              continue;
+            }
+            const err = new Error(msg);
+            err.status = r.status;
+            throw err;
+          }
+          const content = data.choices?.[0]?.message?.content?.trim() ?? "";
+          if (!content) { console.warn(`[OpenRouter] Empty response from ${model} → trying next`); continue; }
+          console.log(`[OpenRouter] ✓ Success via ${model}`);
+          return content;
+        } catch (e) {
+          if (isRateLimitError(e)) throw e;
+          console.warn(`[OpenRouter] ${model} error: ${e.message} → trying next`);
+        }
+      }
+      throw new Error("Tất cả OpenRouter free models đều không khả dụng.");
+    }
+
+    // 🔹 6. Gemini Free — Last resort
     async function callGemini(prompt, systemPrompt = "", maxTokens = 1024) {
       if (!GEMINI_API_KEY) throw new Error("NO_GEMINI_KEY");
-      console.log("[LLM:5/5] → Calling Gemini Free (LAST RESORT)...");
+      console.log("[LLM] → Gemini Free (LAST RESORT)...");
       const r = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
         {
@@ -292,16 +282,16 @@ export default async function handler(req, res) {
       return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
     }
 
-    // 🔀 Fallback chain theo thứ tự tối ưu:
-    //   1. Groq llama-3.3-70b-versatile — mạnh, TPM cao hơn 8b, context lớn
-    //   2. DeepSeek deepseek-chat       — 5M token free, không rate limit cứng, 128K context
-    //   3. Groq llama-3.1-8b-instant    — nhanh, 14,400 req/ngày nhưng TPM chỉ 6000
-    //   4. HuggingFace                  — ổn định, limit không cố định
-    //   5. NVIDIA NIM                   — backup
-    //   6. OpenRouter/free              — auto-router, 200 req/ngày (để dành, hay bị lỗi endpoint)
+    // 🔀 Fallback chain:
+    //   1. Groq llama-3.3-70b-versatile — mạnh, TPM cao, context lớn
+    //   2. DeepSeek deepseek-chat       — 5M token free, 128K context
+    //   3. Groq llama-3.1-8b-instant    — nhanh, 14,400 req/ngày
+    //   4. NVIDIA NIM ← ĐƯA LÊN ĐÂY    — ~1000 req/tháng, test xem ổn không
+    //   5. HuggingFace                  — ổn định, limit không cố định
+    //   6. OpenRouter/free              — 200 req/ngày, hay bị lỗi endpoint
     //   7. Gemini Free                  — last resort, 20 req/ngày
     async function callLLM(prompt, systemPrompt = "", maxTokens = 1024) {
-      // 1️⃣ Groq llama-3.3-70b-versatile: TPM cao hơn 8b, xử lý tốt file lớn
+      // 1️⃣ Groq 70b
       if (GROQ_API_KEY) {
         try { return await callGroq(prompt, systemPrompt, maxTokens, "llama-3.3-70b-versatile"); }
         catch (e) {
@@ -309,7 +299,7 @@ export default async function handler(req, res) {
           else throw e;
         }
       }
-      // 2️⃣ DeepSeek: 5M token free, không rate limit cứng, context 128K — rất phù hợp file lớn
+      // 2️⃣ DeepSeek
       if (DEEPSEEK_API_KEY) {
         try { return await callDeepSeek(prompt, systemPrompt, maxTokens); }
         catch (e) {
@@ -317,31 +307,31 @@ export default async function handler(req, res) {
           else throw e;
         }
       }
-      // 3️⃣ Groq llama-3.1-8b-instant: 14,400 req/ngày — tốt cho prompt ngắn/vừa
+      // 3️⃣ Groq 8b
       if (GROQ_API_KEY) {
         try { return await callGroq(prompt, systemPrompt, maxTokens, "llama-3.1-8b-instant"); }
         catch (e) {
-          if (isRateLimitError(e)) console.warn("[Fallback 3→4] Groq 8b hết quota/TPM → thử HuggingFace");
+          if (isRateLimitError(e)) console.warn("[Fallback 3→4] Groq 8b hết quota/TPM → thử NVIDIA");
           else throw e;
         }
       }
-      // 4️⃣ HuggingFace: ổn định, không có hard limit/ngày rõ ràng
-      if (HF_TOKEN) {
-        try { return await callHuggingFace(prompt, systemPrompt, maxTokens); }
-        catch (e) {
-          if (isRateLimitError(e)) console.warn("[Fallback 4→5] HuggingFace hết quota → thử NVIDIA");
-          else throw e;
-        }
-      }
-      // 5️⃣ NVIDIA NIM: backup tốt, limit ~1000 req/tháng
+      // 4️⃣ NVIDIA NIM ← ĐƯA LÊN TRƯỚC để test
       if (NVIDIA_API_KEY) {
         try { return await callNvidia(prompt, systemPrompt, maxTokens); }
         catch (e) {
-          if (isRateLimitError(e)) console.warn("[Fallback 5→6] NVIDIA hết quota → thử OpenRouter");
+          if (isRateLimitError(e)) console.warn("[Fallback 4→5] NVIDIA hết quota → thử HuggingFace");
           else throw e;
         }
       }
-      // 6️⃣ OpenRouter: để dành gần cuối vì hay gặp lỗi endpoint, 200 req/ngày
+      // 5️⃣ HuggingFace
+      if (HF_TOKEN) {
+        try { return await callHuggingFace(prompt, systemPrompt, maxTokens); }
+        catch (e) {
+          if (isRateLimitError(e)) console.warn("[Fallback 5→6] HuggingFace hết quota → thử OpenRouter");
+          else throw e;
+        }
+      }
+      // 6️⃣ OpenRouter
       if (OPENROUTER_API_KEY) {
         try { return await callOpenRouter(prompt, systemPrompt, maxTokens); }
         catch (e) {
@@ -349,8 +339,8 @@ export default async function handler(req, res) {
           else throw e;
         }
       }
-      // 7️⃣ Gemini Free: LAST RESORT — chỉ 20 req/ngày, tiết kiệm tối đa
-      console.warn("[Fallback] Gemini Free LAST RESORT (20 req/ngày) — tất cả provider khác đã hết quota");
+      // 7️⃣ Gemini Free: LAST RESORT
+      console.warn("[Fallback] Gemini Free LAST RESORT (20 req/ngày)");
       return await callGemini(prompt, systemPrompt, maxTokens);
     }
 
@@ -361,19 +351,15 @@ export default async function handler(req, res) {
     const DOCX_EXTS    = new Set([".docx"]);
     const XLSX_EXTS    = new Set([".xlsx", ".xls"]);
     const PPTX_EXTS    = new Set([".pptx"]);
-    const MAX_CHARS    = 15000; // giới hạn ký tự gửi LLM
-    const MAX_FILE_MB  = 20;    // giới hạn kích thước file tải về
+    const MAX_CHARS    = 15000;
+    const MAX_FILE_MB  = 20;
 
     function truncate(text) {
       return text.length > MAX_CHARS ? text.substring(0, MAX_CHARS) + "\n...[bị cắt bớt]" : text;
     }
 
-    // Đọc nội dung text thuần
-    async function parseText(buffer) {
-      return buffer.toString("utf-8");
-    }
+    async function parseText(buffer) { return buffer.toString("utf-8"); }
 
-    // Đọc PDF bằng pdf-parse (không cần Gemini Vision)
     async function parsePdf(buffer) {
       try {
         const data = await pdfParse(buffer);
@@ -387,7 +373,6 @@ export default async function handler(req, res) {
       }
     }
 
-    // Đọc DOCX bằng mammoth
     async function parseDocx(buffer) {
       const result = await mammoth.extractRawText({ buffer });
       const text = result.value?.trim() ?? "";
@@ -396,7 +381,6 @@ export default async function handler(req, res) {
       return text;
     }
 
-    // Đọc XLSX/XLS bằng xlsx
     async function parseXlsx(buffer) {
       const wb = XLSX.read(buffer, { type: "buffer" });
       const sheets = wb.SheetNames.map(name => {
@@ -409,10 +393,8 @@ export default async function handler(req, res) {
       return text;
     }
 
-    // Đọc PPTX bằng officeparser
     async function parsePptx(buffer) {
       try {
-        // officeparser nhận buffer hoặc path
         const text = await new Promise((resolve, reject) => {
           officeParser.parseOffice(buffer, (data, err) => {
             if (err) reject(err);
@@ -429,7 +411,6 @@ export default async function handler(req, res) {
       }
     }
 
-    // Router: chọn parser theo ext, trả về text đã truncate
     async function extractText(buffer, ext) {
       if (TEXT_EXTS.has(ext))  return truncate(await parseText(buffer));
       if (PDF_EXTS.has(ext))   return truncate(await parsePdf(buffer));
@@ -519,7 +500,6 @@ export default async function handler(req, res) {
     // ─── 6. AI Chọn File ─────────────────────────────────────────────────────
     const SUPPORTED_EXTS = new Set([...TEXT_EXTS, ...PDF_EXTS, ...DOCX_EXTS, ...XLSX_EXTS, ...PPTX_EXTS]);
 
-    // Chỉ hiển thị file có định dạng hỗ trợ cho AI chọn
     const supportedFiles = allFiles.filter(f => {
       const ext = f.name.substring(f.name.lastIndexOf(".")).toLowerCase();
       return SUPPORTED_EXTS.has(ext);
@@ -545,12 +525,10 @@ export default async function handler(req, res) {
       selectedFile = supportedFiles[selectedIndex - 1];
       const ext = selectedFile.name.substring(selectedFile.name.lastIndexOf(".")).toLowerCase();
 
-      // Kiểm tra kích thước trước khi tải
       const fileSizeMB = selectedFile.size / (1024 * 1024);
       if (fileSizeMB > MAX_FILE_MB) {
         answer = `File "${selectedFile.name}" quá lớn (${fileSizeMB.toFixed(1)} MB). Giới hạn hiện tại là ${MAX_FILE_MB} MB.`;
       } else {
-        // Tải file
         const dlRes = await fetch(
           `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${selectedFile.id}/content`,
           { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -579,7 +557,6 @@ export default async function handler(req, res) {
         }
       }
     } else {
-      // Không tìm thấy file phù hợp → gợi ý
       answer = await callLLM(
         `Câu hỏi: "${question}"\n\nDanh sách file hiện có:\n${fileList.substring(0, 3000)}`,
         "Không tìm thấy file phù hợp. Hãy gợi ý người dùng nên tìm trong file nào dựa trên danh sách.",
