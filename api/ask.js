@@ -44,6 +44,18 @@ export default async function handler(req, res) {
 
     // ─── 3. LLM PROVIDERS (FREE TIER — FALLBACK CHAIN 1→2→3→4→5) ────────────
 
+    // 🔍 Chỉ fallback khi đúng lỗi rate limit / quota — lỗi thật thì throw luôn
+    function isRateLimitError(e) {
+      return (
+        e.status === 429 ||
+        e.message?.toLowerCase().includes("quota") ||
+        e.message?.toLowerCase().includes("rate limit") ||
+        e.message?.toLowerCase().includes("rate_limit") ||
+        e.message?.toLowerCase().includes("too many") ||
+        e.message?.toLowerCase().includes("exceeded")
+      );
+    }
+
     // 🔹 1. Groq — Free tier, nhanh nhất, ưu tiên số 1
     async function callGroq(prompt, systemPrompt = "", maxTokens = 1024) {
       if (!GROQ_API_KEY) throw new Error("NO_GROQ_KEY");
@@ -220,18 +232,6 @@ export default async function handler(req, res) {
       }
       console.log("[Gemini] ✓ Success");
       return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
-    }
-
-    // 🔍 Chỉ fallback khi đúng lỗi rate limit / quota — lỗi thật thì throw luôn
-    function isRateLimitError(e) {
-      return (
-        e.status === 429 ||
-        e.message?.toLowerCase().includes("quota") ||
-        e.message?.toLowerCase().includes("rate limit") ||
-        e.message?.toLowerCase().includes("rate_limit") ||
-        e.message?.toLowerCase().includes("too many") ||
-        e.message?.toLowerCase().includes("exceeded")
-      );
     }
 
     // 🔀 Fallback chain: Groq → OpenRouter → HuggingFace → NVIDIA → Gemini
