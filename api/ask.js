@@ -458,7 +458,7 @@ export default async function handler(req, res) {
     const accessToken = tokenData.access_token;
 
     const siteRes = await fetch(
-      `https://graph.microsoft.com/v1.0/sites/tbcball.sharepoint.com:/sites/${process.env.SHAREPOINT_SITE}`,
+      `https://graph.microsoft.com/v1.0/sites/company.sharepoint.com:/sites/${process.env.SHAREPOINT_SITE}`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
     );
     const siteData = await siteRes.json();
